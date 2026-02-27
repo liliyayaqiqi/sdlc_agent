@@ -199,6 +199,7 @@ class ReviewRequest(BaseModel):
 
     workspace_id: str
     patch_text: str
+    llm_model: str = "openai:gpt-4o"
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
     max_symbols: int = 24
@@ -214,4 +215,3 @@ class ReviewRequest(BaseModel):
         if not self.patch_text.strip():
             raise ValueError("patch_text is empty")
         return self
-

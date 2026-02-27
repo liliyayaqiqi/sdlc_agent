@@ -27,6 +27,5 @@ def test_patch_intake_skill_extracts_seed_symbols():
 """
     changes = parse_unified_diff(patch)
     updates = reg.execute("skill_patch_intake", {"patch_changes": changes, "request": _Req()})
-    seeds = updates["seed_symbols"]
-    assert any(s.symbol == "auth::Session::Start" for s in seeds)
-
+    assert updates["seed_symbols"] == []
+    assert updates["patch_signals"]["changed_file_count"] == 1

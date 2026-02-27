@@ -12,6 +12,7 @@ from review_agent.models import Severity
 class AgentSettings(BaseModel):
     """Configurable runtime knobs for review execution."""
 
+    llm_model: str = "openai:gpt-4o"
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
     max_symbols: int = Field(default=24, ge=1, le=100)
@@ -28,6 +29,7 @@ class AgentSettings(BaseModel):
         fail_raw = os.getenv("REVIEW_AGENT_FAIL_ON_SEVERITY", "high").strip().lower()
         fail = Severity(fail_raw) if fail_raw in {s.value for s in Severity} else Severity.HIGH
         return cls(
+            llm_model=os.getenv("REVIEW_AGENT_LLM_MODEL", "openai:gpt-4o").strip(),
             cxxtract_base_url=os.getenv("REVIEW_AGENT_CXXTRACT_BASE_URL", "http://127.0.0.1:8000").strip(),
             fail_on_severity=fail,
             max_symbols=int(os.getenv("REVIEW_AGENT_MAX_SYMBOLS", "24")),
@@ -38,4 +40,3 @@ class AgentSettings(BaseModel):
             max_candidates_per_symbol=int(os.getenv("REVIEW_AGENT_MAX_CANDIDATES_PER_SYMBOL", "150")),
             max_fetch_limit=int(os.getenv("REVIEW_AGENT_MAX_FETCH_LIMIT", "2000")),
         )
-

@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     request = ReviewRequest(
         workspace_id=args.workspace_id,
         patch_text=patch_text,
+        llm_model=args.llm_model or settings.llm_model,
         cxxtract_base_url=args.cxxtract_base_url or settings.cxxtract_base_url,
         fail_on_severity=fail_on,
         max_symbols=args.max_symbols or settings.max_symbols,
@@ -65,6 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--workspace-id", required=True, help="Registered CXXtract workspace id")
     run.add_argument("--patch-file", default="", help="Path to unified git patch")
     run.add_argument("--patch-stdin", action="store_true", default=False, help="Read patch text from stdin")
+    run.add_argument("--llm-model", default="", help="PydanticAI model id (e.g. openai:gpt-4o)")
     run.add_argument("--cxxtract-base-url", default="", help="CXXtract API base URL")
     run.add_argument("--fail-on", default="", choices=[s.value for s in Severity], help="CI fail threshold")
     run.add_argument("--out-dir", default="./review_agent_output", help="Output directory for report files")
@@ -97,4 +99,3 @@ def _load_patch_text(args: argparse.Namespace) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

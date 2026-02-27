@@ -28,6 +28,32 @@ class CxxtractHttpClient:
     def workspace_info(self) -> dict[str, Any]:
         return self._get(f"/workspace/{quote(self.workspace_id, safe='')}")
 
+    def agent_investigate_symbol(self, *, symbol: str) -> dict[str, Any]:
+        return self._post(
+            "/agent/investigate-symbol",
+            {"workspace_id": self.workspace_id, "symbol": symbol},
+            headers={"x-cxxtract-workspace-id": self.workspace_id},
+        )
+
+    def agent_search_analyze_recent_commits(self, *, query: str, limit: int = 5) -> dict[str, Any]:
+        return self._post(
+            "/agent/search-analyze-recent-commits",
+            {"workspace_id": self.workspace_id, "query": query, "limit": limit},
+            headers={"x-cxxtract-workspace-id": self.workspace_id},
+        )
+
+    def agent_read_file_context(self, *, file_path: str, start_line: int = 1, end_line: int = 0) -> dict[str, Any]:
+        return self._post(
+            "/agent/read-file-context",
+            {
+                "workspace_id": self.workspace_id,
+                "file_path": file_path,
+                "start_line": start_line,
+                "end_line": end_line,
+            },
+            headers={"x-cxxtract-workspace-id": self.workspace_id},
+        )
+
     def explore_list_candidates(
         self,
         *,
@@ -186,20 +212,30 @@ class CxxtractHttpClient:
             {"workspace_id": self.workspace_id, "file_key": file_key},
         )
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         with httpx.Client(timeout=self.timeout_s) as client:
             try:
-                response = client.get(url, params=params)
+                response = client.get(url, params=params, headers=headers)
             except Exception as exc:
                 raise CxxtractHttpError(0, str(exc)) from exc
         return self._decode(response)
 
-    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        path: str,
+        body: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         with httpx.Client(timeout=self.timeout_s) as client:
             try:
-                response = client.post(url, json=body)
+                response = client.post(url, json=body, headers=headers)
             except Exception as exc:
                 raise CxxtractHttpError(0, str(exc)) from exc
         return self._decode(response)
@@ -215,4 +251,3 @@ class CxxtractHttpClient:
         if isinstance(payload, dict):
             return payload
         return {"result": payload}
-

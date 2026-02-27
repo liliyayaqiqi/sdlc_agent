@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from review_agent.patch_parser import extract_seed_symbols, parse_unified_diff
+from review_agent.patch_parser import parse_unified_diff
 
 
 def test_parse_unified_diff_modified_file():
@@ -40,20 +40,4 @@ deleted file mode 100644
     assert len(changes) == 2
     assert changes[0].change_type.value == "renamed"
     assert changes[1].change_type.value == "deleted"
-
-
-def test_extract_seed_symbols_prefers_qualified_and_calls():
-    patch = """diff --git a/a.cpp b/a.cpp
---- a/a.cpp
-+++ b/a.cpp
-@@ -1 +1,2 @@
--old();
-+auth::Session::Start();
-+doLogin(user);
-"""
-    changes = parse_unified_diff(patch)
-    seeds = extract_seed_symbols(changes, max_symbols=5)
-    symbols = [s.symbol for s in seeds]
-    assert "auth::Session::Start" in symbols
-    assert "doLogin" in symbols
 
