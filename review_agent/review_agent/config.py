@@ -22,6 +22,8 @@ class AgentSettings(BaseModel):
     parse_workers: int = Field(default=4, ge=1, le=64)
     max_candidates_per_symbol: int = Field(default=150, ge=1, le=2000)
     max_fetch_limit: int = Field(default=2000, ge=10, le=20000)
+    enable_cache: bool = True
+    cache_dir: str = ".review_agent_cache"
 
     @classmethod
     def from_env(cls) -> "AgentSettings":
@@ -39,4 +41,6 @@ class AgentSettings(BaseModel):
             parse_workers=int(os.getenv("REVIEW_AGENT_PARSE_WORKERS", "4")),
             max_candidates_per_symbol=int(os.getenv("REVIEW_AGENT_MAX_CANDIDATES_PER_SYMBOL", "150")),
             max_fetch_limit=int(os.getenv("REVIEW_AGENT_MAX_FETCH_LIMIT", "2000")),
+            enable_cache=os.getenv("REVIEW_AGENT_ENABLE_CACHE", "true").strip().lower() in {"1", "true", "yes", "on"},
+            cache_dir=os.getenv("REVIEW_AGENT_CACHE_DIR", ".review_agent_cache").strip() or ".review_agent_cache",
         )

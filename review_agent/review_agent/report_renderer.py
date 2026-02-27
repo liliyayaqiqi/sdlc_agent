@@ -49,7 +49,33 @@ def render_markdown(report: ReviewReport) -> str:
                     elif ev.symbol:
                         loc = ev.symbol
                     lines.append(f"  - `{ev.tool}` {loc} {desc}".rstrip())
-            lines.append("")
+    lines.append("")
+
+    if report.fact_sheet is not None:
+        lines.append("## Fact Sheet")
+        lines.append("")
+        lines.append(f"- Changed files: `{len(report.fact_sheet.changed_files)}`")
+        lines.append(f"- Changed hunks: `{report.fact_sheet.changed_hunk_count}`")
+        lines.append(f"- Seed symbols: `{len(report.fact_sheet.seed_symbols)}`")
+        lines.append(f"- Suspicious anchors: `{len(report.fact_sheet.suspicious_anchors)}`")
+        if report.fact_sheet.warnings:
+            lines.append("- Fact-sheet warnings:")
+            for warn in report.fact_sheet.warnings[:20]:
+                lines.append(f"  - {warn}")
+        lines.append("")
+
+    if report.test_impact is not None:
+        lines.append("## Test Impact")
+        lines.append("")
+        lines.append(f"- Directly impacted tests: `{len(report.test_impact.directly_impacted_tests)}`")
+        lines.append(f"- Likely impacted tests: `{len(report.test_impact.likely_impacted_tests)}`")
+        if report.test_impact.suggested_scopes:
+            lines.append(f"- Suggested scopes: `{', '.join(report.test_impact.suggested_scopes)}`")
+        if report.test_impact.rationale:
+            lines.append("- Rationale:")
+            for row in report.test_impact.rationale[:10]:
+                lines.append(f"  - {row}")
+        lines.append("")
 
     lines.append("## Coverage")
     lines.append("")
@@ -75,4 +101,3 @@ def render_markdown(report: ReviewReport) -> str:
             lines.append(f"- `{row.skill}` -> `{row.tool}` [{state}] {row.elapsed_ms:.1f}ms{note}")
     lines.append("")
     return "\n".join(lines)
-

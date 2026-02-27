@@ -5,17 +5,17 @@ from review_agent.models import (
     FindingCategory,
     ReviewDecision,
     ReviewFinding,
+    ReviewPlan,
     ReviewReport,
     ReviewRequest,
     Severity,
-    ToolCallRecord,
 )
 from review_agent.orchestrator import ReviewOrchestrator
 
 
 class _FakeClient:
     def workspace_info(self):
-        return {"workspace_id": "ws_main"}
+        return {"workspace_id": "ws_main", "contexts": ["ws_main:baseline"], "repos": ["repoA"]}
 
 
 class _FakeResult:
@@ -23,22 +23,13 @@ class _FakeResult:
         self.data = data
 
 
-class _FakeAgent:
-    def __init__(self):
-        self.last_prompt = ""
-        self.last_deps = None
+class _FakePlanner:
+    def run_sync(self, _prompt):
+        return _FakeResult(ReviewPlan(prioritized_symbols=[]))
 
-    def run_sync(self, prompt, deps):
-        self.last_prompt = prompt
-        self.last_deps = deps
-        deps.tool_usage.append(
-            ToolCallRecord(
-                skill="agentic_llm",
-                tool="agent.investigate_symbol",
-                success=True,
-                elapsed_ms=12.3,
-            )
-        )
+
+class _FakeSynth:
+    def run_sync(self, _prompt):
         report = ReviewReport(
             workspace_id="wrong_ws",
             summary="",
@@ -58,27 +49,28 @@ class _FakeAgent:
                 blocking_findings=0,
                 should_block=False,
             ),
+            tool_usage=[],
         )
         return _FakeResult(report)
 
 
-def test_orchestrator_uses_agent_and_normalizes_report():
-    fake_agent = _FakeAgent()
+def test_orchestrator_builds_fact_sheet_and_policy_gates():
     orchestrator = ReviewOrchestrator(
         client=_FakeClient(),
-        agent_factory=lambda _model: fake_agent,
+        planner_factory=lambda _model: _FakePlanner(),
+        synthesis_factory=lambda _model: _FakeSynth(),
     )
     req = ReviewRequest(
         workspace_id="ws_main",
         patch_text="diff --git a/a.cpp b/a.cpp\n",
         llm_model="openai:gpt-4o",
         fail_on_severity=Severity.HIGH,
+        enable_cache=False,
     )
     report = orchestrator.run(req)
-
-    assert "PR patch (unified diff)" in fake_agent.last_prompt
     assert report.workspace_id == "ws_main"
+    assert report.fact_sheet is not None
+    assert report.test_impact is not None
     assert report.decision.fail_threshold == Severity.HIGH
-    assert report.decision.blocking_findings == 1
-    assert report.decision.should_block is True
-    assert len(report.tool_usage) == 1
+    # High finding without evidence should be downgraded by policy gate.
+    assert report.findings[0].severity != Severity.HIGH

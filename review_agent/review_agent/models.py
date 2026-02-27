@@ -1,4 +1,4 @@
-"""Typed models for patch intake, findings, and review output."""
+"""Typed models for context intake, evidence, findings, and review output."""
 
 from __future__ import annotations
 
@@ -94,18 +94,6 @@ class ReviewDecision(BaseModel):
     should_block: bool
 
 
-class ReviewReport(BaseModel):
-    """Final review report in structured form."""
-
-    workspace_id: str
-    summary: str
-    findings: list[ReviewFinding] = Field(default_factory=list)
-    coverage: CoverageSummary = Field(default_factory=CoverageSummary)
-    decision: ReviewDecision
-    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    tool_usage: list[ToolCallRecord] = Field(default_factory=list)
-
-
 class HunkLine(BaseModel):
     """A line inside one unified-diff hunk."""
 
@@ -160,6 +148,30 @@ class SeedSymbol(BaseModel):
     score: float = 0.0
 
 
+class SuspiciousAnchor(BaseModel):
+    """Deterministic non-symbol anchor extracted from changed lines."""
+
+    kind: str
+    file_path: str
+    line: int = 0
+    reason: str = ""
+    snippet: str = ""
+
+
+class PrepassResult(BaseModel):
+    """Deterministic pre-pass output before any LLM reasoning."""
+
+    changed_files: list[str] = Field(default_factory=list)
+    changed_hunk_count: int = 0
+    seed_symbols: list[SeedSymbol] = Field(default_factory=list)
+    suspicious_anchors: list[SuspiciousAnchor] = Field(default_factory=list)
+    changed_methods: list[str] = Field(default_factory=list)
+    added_call_sites: list[str] = Field(default_factory=list)
+    removed_call_sites: list[str] = Field(default_factory=list)
+    include_macro_config_changes: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class SymbolImpact(BaseModel):
     """Semantic impact bundle for one symbol investigation."""
 
@@ -174,7 +186,10 @@ class SymbolImpact(BaseModel):
     symbols: list[dict[str, Any]] = Field(default_factory=list)
     references: list[dict[str, Any]] = Field(default_factory=list)
     call_edges: list[dict[str, Any]] = Field(default_factory=list)
+    rg_hits: list[dict[str, Any]] = Field(default_factory=list)
+    read_contexts: list[dict[str, Any]] = Field(default_factory=list)
     confidence: dict[str, Any] = Field(default_factory=dict)
+    macro_summary: str = ""
     warnings: list[str] = Field(default_factory=list)
 
     @property
@@ -194,11 +209,110 @@ class SymbolImpact(BaseModel):
         return sorted(repos)
 
 
+class SymbolFact(BaseModel):
+    """Deterministic facts and deltas for one reviewed symbol."""
+
+    symbol: str
+    candidate_file_keys: list[str] = Field(default_factory=list)
+    parsed_file_keys: list[str] = Field(default_factory=list)
+    head_reference_count: int = 0
+    baseline_reference_count: int = 0
+    merge_preview_reference_count: int = 0
+    head_call_edge_count: int = 0
+    baseline_call_edge_count: int = 0
+    merge_preview_call_edge_count: int = 0
+    reference_delta_vs_baseline: int = 0
+    call_edge_delta_vs_baseline: int = 0
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ReviewPlan(BaseModel):
+    """LLM-generated review plan controlling deterministic evidence collection."""
+
+    prioritized_symbols: list[str] = Field(default_factory=list)
+    lexical_files: list[str] = Field(default_factory=list)
+    semantic_files: list[str] = Field(default_factory=list)
+    require_merge_preview: bool = False
+    budget_split: dict[str, int] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+class ViewContextMaterialization(BaseModel):
+    """Status of baseline/head/merge-preview context preparation."""
+
+    baseline_context_id: str = ""
+    head_context_id: str = ""
+    merge_preview_context_id: str = ""
+    baseline_materialized: bool = False
+    head_materialized: bool = False
+    merge_preview_materialized: bool = False
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ReviewFactSheet(BaseModel):
+    """Deterministic fact layer that powers synthesis and policy gating."""
+
+    changed_files: list[str] = Field(default_factory=list)
+    changed_hunk_count: int = 0
+    seed_symbols: list[str] = Field(default_factory=list)
+    suspicious_anchors: list[SuspiciousAnchor] = Field(default_factory=list)
+    changed_methods: list[str] = Field(default_factory=list)
+    added_call_sites: list[str] = Field(default_factory=list)
+    removed_call_sites: list[str] = Field(default_factory=list)
+    include_macro_config_changes: list[str] = Field(default_factory=list)
+    symbol_facts: list[SymbolFact] = Field(default_factory=list)
+    evidence_anchors: list[EvidenceRef] = Field(default_factory=list)
+    coverage: CoverageSummary = Field(default_factory=CoverageSummary)
+    view_contexts: ViewContextMaterialization = Field(default_factory=ViewContextMaterialization)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class TestImpact(BaseModel):
+    """Deterministic test-impact recommendation output."""
+
+    directly_impacted_tests: list[str] = Field(default_factory=list)
+    likely_impacted_tests: list[str] = Field(default_factory=list)
+    suggested_scopes: list[str] = Field(default_factory=list)
+    rationale: list[str] = Field(default_factory=list)
+
+
+class ReviewReport(BaseModel):
+    """Final review report in structured form."""
+
+    workspace_id: str
+    summary: str
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    coverage: CoverageSummary = Field(default_factory=CoverageSummary)
+    decision: ReviewDecision
+    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    tool_usage: list[ToolCallRecord] = Field(default_factory=list)
+    fact_sheet: ReviewFactSheet | None = None
+    test_impact: TestImpact | None = None
+
+
+class ReviewContextBundle(BaseModel):
+    """PR/MR-driven review context bundle."""
+
+    workspace_id: str
+    patch_text: str = ""
+    changed_files: list[str] = Field(default_factory=list)
+    changed_hunks: list[dict[str, Any]] = Field(default_factory=list)
+    base_sha: str = ""
+    head_sha: str = ""
+    target_branch_head_sha: str = ""
+    merge_preview_sha: str = ""
+    primary_repo_id: str = ""
+    per_repo_shas: dict[str, str] = Field(default_factory=dict)
+    pr_metadata: dict[str, Any] = Field(default_factory=dict)
+    policy: dict[str, Any] = Field(default_factory=dict)
+
+
 class ReviewRequest(BaseModel):
     """Top-level request consumed by the orchestrator."""
 
     workspace_id: str
-    patch_text: str
+    patch_text: str = ""
+    context_bundle: ReviewContextBundle | None = None
     llm_model: str = "openai:gpt-4o"
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
@@ -209,9 +323,14 @@ class ReviewRequest(BaseModel):
     parse_workers: int = 4
     max_candidates_per_symbol: int = 150
     max_fetch_limit: int = 2000
+    enable_cache: bool = True
+    cache_dir: str = ".review_agent_cache"
 
     @model_validator(mode="after")
-    def _validate_patch(self) -> "ReviewRequest":
-        if not self.patch_text.strip():
-            raise ValueError("patch_text is empty")
+    def _validate_request(self) -> "ReviewRequest":
+        if self.context_bundle is not None and self.context_bundle.workspace_id != self.workspace_id:
+            raise ValueError("context_bundle.workspace_id does not match workspace_id")
+        bundle_patch = (self.context_bundle.patch_text if self.context_bundle else "").strip()
+        if not self.patch_text.strip() and not bundle_patch:
+            raise ValueError("patch_text is empty and context_bundle.patch_text is empty")
         return self

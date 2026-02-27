@@ -1,4 +1,4 @@
-"""Thin HTTP client over CXXtract2 endpoints used by review skills."""
+"""Thin HTTP client over CXXtract2 endpoints used by review orchestration."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class CxxtractHttpError(RuntimeError):
 
 
 class CxxtractHttpClient:
-    """HTTP wrapper used by skill executors."""
+    """HTTP wrapper used by agent orchestration and evidence collection."""
 
     def __init__(self, base_url: str, workspace_id: str, timeout_s: float = 30.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -27,6 +27,46 @@ class CxxtractHttpClient:
 
     def workspace_info(self) -> dict[str, Any]:
         return self._get(f"/workspace/{quote(self.workspace_id, safe='')}")
+
+    def context_create_pr_overlay(
+        self,
+        *,
+        pr_id: str,
+        base_ref: str = "",
+        head_ref: str = "",
+        context_id: str = "",
+    ) -> dict[str, Any]:
+        return self._post(
+            "/context/create-pr-overlay",
+            {
+                "workspace_id": self.workspace_id,
+                "pr_id": pr_id or "review",
+                "base_ref": base_ref,
+                "head_ref": head_ref,
+                "context_id": context_id,
+            },
+        )
+
+    def context_expire(self, *, context_id: str) -> dict[str, Any]:
+        return self._post(f"/context/{quote(context_id, safe='')}/expire", {})
+
+    def sync_repo(
+        self,
+        *,
+        repo_id: str,
+        commit_sha: str,
+        branch: str = "",
+        force_clean: bool = True,
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/workspace/{quote(self.workspace_id, safe='')}/sync-repo",
+            {
+                "repo_id": repo_id,
+                "commit_sha": commit_sha,
+                "branch": branch,
+                "force_clean": bool(force_clean),
+            },
+        )
 
     def agent_investigate_symbol(self, *, symbol: str) -> dict[str, Any]:
         return self._post(
@@ -54,6 +94,32 @@ class CxxtractHttpClient:
             headers={"x-cxxtract-workspace-id": self.workspace_id},
         )
 
+    def explore_rg_search(
+        self,
+        *,
+        query: str,
+        mode: str = "symbol",
+        analysis_context: dict[str, Any] | None = None,
+        scope: dict[str, Any] | None = None,
+        max_hits: int = 200,
+        max_files: int = 200,
+        timeout_s: int = 30,
+        context_lines: int = 0,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "query": query,
+            "mode": mode,
+            "scope": scope or {"entry_repos": [], "max_repo_hops": 2},
+            "max_hits": max_hits,
+            "max_files": max_files,
+            "timeout_s": timeout_s,
+            "context_lines": context_lines,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/rg-search", body)
+
     def explore_list_candidates(
         self,
         *,
@@ -62,32 +128,34 @@ class CxxtractHttpClient:
         include_rg: bool = True,
         entry_repos: list[str] | None = None,
         max_repo_hops: int = 2,
+        analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._post(
-            "/explore/list-candidates",
-            {
-                "workspace_id": self.workspace_id,
-                "symbol": symbol,
-                "scope": {"entry_repos": entry_repos or [], "max_repo_hops": max_repo_hops},
-                "max_files": max_files,
-                "include_rg": include_rg,
-            },
-        )
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "symbol": symbol,
+            "scope": {"entry_repos": entry_repos or [], "max_repo_hops": max_repo_hops},
+            "max_files": max_files,
+            "include_rg": include_rg,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/list-candidates", body)
 
     def explore_classify_freshness(
         self,
         *,
         candidate_file_keys: list[str],
         max_files: int,
+        analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._post(
-            "/explore/classify-freshness",
-            {
-                "workspace_id": self.workspace_id,
-                "candidate_file_keys": candidate_file_keys,
-                "max_files": max_files,
-            },
-        )
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "candidate_file_keys": candidate_file_keys,
+            "max_files": max_files,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/classify-freshness", body)
 
     def explore_parse_file(
         self,
@@ -96,17 +164,18 @@ class CxxtractHttpClient:
         max_parse_workers: int,
         timeout_s: int,
         skip_if_fresh: bool = True,
+        analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._post(
-            "/explore/parse-file",
-            {
-                "workspace_id": self.workspace_id,
-                "file_keys": file_keys,
-                "max_parse_workers": max_parse_workers,
-                "timeout_s": timeout_s,
-                "skip_if_fresh": skip_if_fresh,
-            },
-        )
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "file_keys": file_keys,
+            "max_parse_workers": max_parse_workers,
+            "timeout_s": timeout_s,
+            "skip_if_fresh": skip_if_fresh,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/parse-file", body)
 
     def explore_fetch_symbols(
         self,
@@ -115,17 +184,18 @@ class CxxtractHttpClient:
         candidate_file_keys: list[str],
         excluded_file_keys: list[str],
         limit: int,
+        analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._post(
-            "/explore/fetch-symbols",
-            {
-                "workspace_id": self.workspace_id,
-                "symbol": symbol,
-                "candidate_file_keys": candidate_file_keys,
-                "excluded_file_keys": excluded_file_keys,
-                "limit": limit,
-            },
-        )
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "symbol": symbol,
+            "candidate_file_keys": candidate_file_keys,
+            "excluded_file_keys": excluded_file_keys,
+            "limit": limit,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/fetch-symbols", body)
 
     def explore_fetch_references(
         self,
@@ -134,17 +204,18 @@ class CxxtractHttpClient:
         candidate_file_keys: list[str],
         excluded_file_keys: list[str],
         limit: int,
+        analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._post(
-            "/explore/fetch-references",
-            {
-                "workspace_id": self.workspace_id,
-                "symbol": symbol,
-                "candidate_file_keys": candidate_file_keys,
-                "excluded_file_keys": excluded_file_keys,
-                "limit": limit,
-            },
-        )
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "symbol": symbol,
+            "candidate_file_keys": candidate_file_keys,
+            "excluded_file_keys": excluded_file_keys,
+            "limit": limit,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/fetch-references", body)
 
     def explore_fetch_call_edges(
         self,
@@ -154,18 +225,19 @@ class CxxtractHttpClient:
         candidate_file_keys: list[str],
         excluded_file_keys: list[str],
         limit: int,
+        analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._post(
-            "/explore/fetch-call-edges",
-            {
-                "workspace_id": self.workspace_id,
-                "symbol": symbol,
-                "direction": direction,
-                "candidate_file_keys": candidate_file_keys,
-                "excluded_file_keys": excluded_file_keys,
-                "limit": limit,
-            },
-        )
+        body: dict[str, Any] = {
+            "workspace_id": self.workspace_id,
+            "symbol": symbol,
+            "direction": direction,
+            "candidate_file_keys": candidate_file_keys,
+            "excluded_file_keys": excluded_file_keys,
+            "limit": limit,
+        }
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/fetch-call-edges", body)
 
     def explore_get_confidence(
         self,
@@ -206,11 +278,16 @@ class CxxtractHttpClient:
             },
         )
 
-    def explore_get_compile_command(self, *, file_key: str) -> dict[str, Any]:
-        return self._post(
-            "/explore/get-compile-command",
-            {"workspace_id": self.workspace_id, "file_key": file_key},
-        )
+    def explore_get_compile_command(
+        self,
+        *,
+        file_key: str,
+        analysis_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"workspace_id": self.workspace_id, "file_key": file_key}
+        if analysis_context:
+            body["analysis_context"] = analysis_context
+        return self._post("/explore/get-compile-command", body)
 
     def _get(
         self,
