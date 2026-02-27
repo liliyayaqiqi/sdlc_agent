@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from review_agent.models import ReviewReport
+
+logger = logging.getLogger("review_agent.report_renderer")
 
 
 def render_markdown(report: ReviewReport) -> str:
@@ -58,6 +62,22 @@ def render_markdown(report: ReviewReport) -> str:
         lines.append(f"- Changed hunks: `{report.fact_sheet.changed_hunk_count}`")
         lines.append(f"- Seed symbols: `{len(report.fact_sheet.seed_symbols)}`")
         lines.append(f"- Suspicious anchors: `{len(report.fact_sheet.suspicious_anchors)}`")
+
+        # Merge delta signals
+        if report.fact_sheet.merge_delta_signals:
+            lines.append("")
+            lines.append("### Merge Delta Signals")
+            lines.append("")
+            for sig in report.fact_sheet.merge_delta_signals[:20]:
+                sym = sig.get("symbol", "?")
+                risk = sig.get("risk", "unknown")
+                merge_ref = sig.get("merge_ref_delta_vs_head", 0)
+                merge_edge = sig.get("merge_edge_delta_vs_head", 0)
+                lines.append(
+                    f"- `{sym}` -- {risk} "
+                    f"(merge-vs-head refs: {merge_ref:+d}, edges: {merge_edge:+d})"
+                )
+
         if report.fact_sheet.warnings:
             lines.append("- Fact-sheet warnings:")
             for warn in report.fact_sheet.warnings[:20]:
@@ -75,6 +95,19 @@ def render_markdown(report: ReviewReport) -> str:
             lines.append("- Rationale:")
             for row in report.test_impact.rationale[:10]:
                 lines.append(f"  - {row}")
+
+        # Test dependency edges
+        if report.test_impact.test_dependency_edges:
+            lines.append("")
+            lines.append("### Test Dependency Edges")
+            lines.append("")
+            for edge in report.test_impact.test_dependency_edges[:30]:
+                sym = edge.get("symbol", "?")
+                tf = edge.get("test_file", "?")
+                src = edge.get("source", "?")
+                ln = edge.get("line", 0)
+                lines.append(f"- `{sym}` -> `{tf}` ({src}, line {ln})")
+
         lines.append("")
 
     lines.append("## Coverage")

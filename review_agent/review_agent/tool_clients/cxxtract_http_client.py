@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import logging
+from time import sleep
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+
+logger = logging.getLogger("review_agent.tool_clients.cxxtract_http_client")
+
+# Paths that mutate server state and must NOT be retried on failure.
+_NON_RETRYABLE_PREFIXES = ("/context/", "/workspace/")
+
+_DEFAULT_RETRIES = 2
+_RETRY_BACKOFF_BASE = 0.5  # seconds
 
 
 class CxxtractHttpError(RuntimeError):
@@ -18,12 +29,46 @@ class CxxtractHttpError(RuntimeError):
 
 
 class CxxtractHttpClient:
-    """HTTP wrapper used by agent orchestration and evidence collection."""
+    """HTTP wrapper used by agent orchestration and evidence collection.
+
+    Supports context-manager usage for connection reuse::
+
+        with CxxtractHttpClient(...) as client:
+            client.workspace_info()
+            # ... many more calls sharing one TCP pool ...
+    """
 
     def __init__(self, base_url: str, workspace_id: str, timeout_s: float = 30.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.workspace_id = workspace_id
         self.timeout_s = timeout_s
+        self._http: httpx.Client | None = None
+
+    # -- context-manager protocol ------------------------------------------
+
+    def __enter__(self) -> "CxxtractHttpClient":
+        self._ensure_http()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        """Close the underlying HTTP connection pool."""
+        if self._http is not None:
+            try:
+                self._http.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._http = None
+
+    def _ensure_http(self) -> httpx.Client:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.Client(timeout=self.timeout_s)
+        return self._http
+
+    # -- public API --------------------------------------------------------
 
     def workspace_info(self) -> dict[str, Any]:
         return self._get(f"/workspace/{quote(self.workspace_id, safe='')}")
@@ -289,6 +334,24 @@ class CxxtractHttpClient:
             body["analysis_context"] = analysis_context
         return self._post("/explore/get-compile-command", body)
 
+    # -- internal transport ------------------------------------------------
+
+    @staticmethod
+    def _is_retryable_path(path: str) -> bool:
+        """Return True if the endpoint is safe to retry (idempotent)."""
+        for prefix in _NON_RETRYABLE_PREFIXES:
+            if path.startswith(prefix):
+                return False
+        return True
+
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        """Return True if the error is transient and worth retrying."""
+        if isinstance(exc, CxxtractHttpError):
+            return exc.status_code >= 500
+        # httpx transport errors (connection reset, timeout, etc.)
+        return isinstance(exc, (httpx.TransportError, httpx.TimeoutException))
+
     def _get(
         self,
         path: str,
@@ -296,12 +359,25 @@ class CxxtractHttpClient:
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        with httpx.Client(timeout=self.timeout_s) as client:
+        http = self._ensure_http()
+        retries = _DEFAULT_RETRIES if self._is_retryable_path(path) else 0
+        last_exc: Exception | None = None
+        for attempt in range(1 + retries):
             try:
-                response = client.get(url, params=params, headers=headers)
+                response = http.get(url, params=params, headers=headers)
+                return self._decode(response)
             except Exception as exc:
+                last_exc = exc
+                if attempt < retries and self._is_retryable_error(exc):
+                    delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("GET %s attempt %d failed (%s), retrying in %.1fs", path, attempt + 1, exc, delay)
+                    sleep(delay)
+                    continue
+                if isinstance(exc, CxxtractHttpError):
+                    raise
                 raise CxxtractHttpError(0, str(exc)) from exc
-        return self._decode(response)
+        # Should not reach here, but satisfy type checker
+        raise CxxtractHttpError(0, str(last_exc)) from last_exc  # pragma: no cover
 
     def _post(
         self,
@@ -310,12 +386,24 @@ class CxxtractHttpClient:
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        with httpx.Client(timeout=self.timeout_s) as client:
+        http = self._ensure_http()
+        retries = _DEFAULT_RETRIES if self._is_retryable_path(path) else 0
+        last_exc: Exception | None = None
+        for attempt in range(1 + retries):
             try:
-                response = client.post(url, json=body, headers=headers)
+                response = http.post(url, json=body, headers=headers)
+                return self._decode(response)
             except Exception as exc:
+                last_exc = exc
+                if attempt < retries and self._is_retryable_error(exc):
+                    delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("POST %s attempt %d failed (%s), retrying in %.1fs", path, attempt + 1, exc, delay)
+                    sleep(delay)
+                    continue
+                if isinstance(exc, CxxtractHttpError):
+                    raise
                 raise CxxtractHttpError(0, str(exc)) from exc
-        return self._decode(response)
+        raise CxxtractHttpError(0, str(last_exc)) from last_exc  # pragma: no cover
 
     @staticmethod
     def _decode(response: httpx.Response) -> dict[str, Any]:

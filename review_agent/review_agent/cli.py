@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
 from pathlib import Path
 
 from review_agent.config import AgentSettings
 from review_agent.models import ReviewContextBundle, ReviewRequest, Severity
 from review_agent.orchestrator import ReviewOrchestrator
+
+logger = logging.getLogger("review_agent.cli")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -21,9 +25,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 1
 
-    patch_text, context_bundle = _load_inputs(args)
+    # --- Logging bootstrap ---
     settings = AgentSettings.from_env()
+    log_level_name = (args.log_level or settings.log_level or "WARNING").upper()
+    numeric_level = getattr(logging, log_level_name, logging.WARNING)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    patch_text, context_bundle = _load_inputs(args)
     fail_on = Severity(args.fail_on.lower()) if args.fail_on else settings.fail_on_severity
+
+    # Resolve max_symbol_slots: prefer new flag, fall back to deprecated --max-tool-rounds, then env
+    max_symbol_slots = args.max_symbol_slots or args.max_tool_rounds or settings.max_symbol_slots
 
     request = ReviewRequest(
         workspace_id=args.workspace_id,
@@ -33,12 +49,13 @@ def main(argv: list[str] | None = None) -> int:
         cxxtract_base_url=args.cxxtract_base_url or settings.cxxtract_base_url,
         fail_on_severity=fail_on,
         max_symbols=args.max_symbols or settings.max_symbols,
-        max_tool_rounds=args.max_tool_rounds or settings.max_tool_rounds,
+        max_symbol_slots=max_symbol_slots,
         max_total_tool_calls=args.max_total_tool_calls or settings.max_total_tool_calls,
         parse_timeout_s=args.parse_timeout_s or settings.parse_timeout_s,
         parse_workers=args.parse_workers or settings.parse_workers,
         max_candidates_per_symbol=args.max_candidates_per_symbol or settings.max_candidates_per_symbol,
         max_fetch_limit=args.max_fetch_limit or settings.max_fetch_limit,
+        review_timeout_s=args.review_timeout_s or settings.review_timeout_s,
         enable_cache=not args.no_cache if args.no_cache else settings.enable_cache,
         cache_dir=args.cache_dir or settings.cache_dir,
     )
@@ -47,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = orchestrator.run(request)
     except Exception as exc:
+        logger.error("review execution failed: %s", exc)
         print(f"[ERROR] review execution failed: {exc}", file=sys.stderr)
         return 1
 
@@ -59,6 +77,31 @@ def main(argv: list[str] | None = None) -> int:
         f"blocking={report.decision.blocking_findings} "
         f"threshold={report.decision.fail_threshold.value}"
     )
+
+    # Post review summary to GitLab MR if flags provided
+    if args.gitlab_url and args.project_id and args.mr_iid:
+        gitlab_token = args.gitlab_token or os.getenv("REVIEW_AGENT_GITLAB_TOKEN", "")
+        if not gitlab_token:
+            logger.warning("--gitlab-token or REVIEW_AGENT_GITLAB_TOKEN not set; skipping MR comment")
+        else:
+            try:
+                from review_agent.tool_clients.gitlab_client import GitLabClient
+
+                gl = GitLabClient(
+                    base_url=args.gitlab_url,
+                    private_token=gitlab_token,
+                )
+                from review_agent.report_renderer import render_markdown as _render_md
+                body = _render_md(report)
+                gl.post_mr_note(
+                    project_id=args.project_id,
+                    mr_iid=int(args.mr_iid),
+                    body=body,
+                )
+                logger.info("posted review summary to MR !%s", args.mr_iid)
+            except Exception as exc:
+                logger.error("failed to post MR comment: %s", exc)
+
     return 2 if report.decision.should_block else 0
 
 
@@ -77,18 +120,36 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--fail-on", default="", choices=[s.value for s in Severity], help="CI fail threshold")
     run.add_argument("--out-dir", default="./review_agent_output", help="Output directory for report files")
     run.add_argument("--max-symbols", type=int, default=0)
-    run.add_argument("--max-tool-rounds", type=int, default=0)
+    # New canonical name
+    run.add_argument("--max-symbol-slots", type=int, default=0, help="Max symbol investigation slots per review")
+    # Deprecated alias for backward compatibility
+    run.add_argument("--max-tool-rounds", type=int, default=0, help="(deprecated, use --max-symbol-slots)")
     run.add_argument("--max-total-tool-calls", type=int, default=0)
     run.add_argument("--parse-timeout-s", type=int, default=0)
     run.add_argument("--parse-workers", type=int, default=0)
     run.add_argument("--max-candidates-per-symbol", type=int, default=0)
     run.add_argument("--max-fetch-limit", type=int, default=0)
+    run.add_argument("--review-timeout-s", type=int, default=0, help="Wall-clock timeout for the entire review run (0=disabled)")
+    run.add_argument("--log-level", default="", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level")
     run.add_argument("--no-cache", action="store_true", default=False, help="Disable local review trace cache")
     run.add_argument("--cache-dir", default="", help="Directory for review trace cache")
+
+    # GitLab integration flags
+    run.add_argument("--gitlab-url", default="", help="GitLab instance base URL (e.g. https://gitlab.com)")
+    run.add_argument("--gitlab-token", default="", help="GitLab private/project access token (prefer REVIEW_AGENT_GITLAB_TOKEN env var)")
+    run.add_argument("--project-id", default="", help="GitLab project ID (numeric or URL-encoded path)")
+    run.add_argument("--mr-iid", default="", help="GitLab Merge Request IID")
     return parser
 
 
 def _load_inputs(args: argparse.Namespace) -> tuple[str, ReviewContextBundle | None]:
+    # If GitLab flags are provided, fetch MR diff and context from GitLab API
+    if getattr(args, "gitlab_url", "") and getattr(args, "project_id", "") and getattr(args, "mr_iid", ""):
+        gitlab_token = getattr(args, "gitlab_token", "") or os.getenv("REVIEW_AGENT_GITLAB_TOKEN", "")
+        if not gitlab_token:
+            raise ValueError("--gitlab-token or REVIEW_AGENT_GITLAB_TOKEN environment variable required for GitLab mode")
+        return _load_from_gitlab(args, gitlab_token)
+
     if args.context_stdin and args.patch_stdin:
         raise ValueError("cannot read both context and patch from stdin in one run")
     context = _load_context_bundle(args)
@@ -96,6 +157,36 @@ def _load_inputs(args: argparse.Namespace) -> tuple[str, ReviewContextBundle | N
     if not patch and context is None:
         raise ValueError("one of patch input (--patch-file/--patch-stdin) or context input (--context-file/--context-stdin) is required")
     return patch, context
+
+
+def _load_from_gitlab(args: argparse.Namespace, token: str) -> tuple[str, ReviewContextBundle | None]:
+    """Fetch MR diff and metadata from GitLab API and produce inputs."""
+    from review_agent.tool_clients.gitlab_client import GitLabClient
+
+    gl = GitLabClient(base_url=args.gitlab_url, private_token=token)
+    mr_iid = int(args.mr_iid)
+    project_id = args.project_id
+
+    metadata = gl.get_mr_metadata(project_id=project_id, mr_iid=mr_iid)
+    diff_text = gl.get_mr_diff(project_id=project_id, mr_iid=mr_iid)
+
+    bundle = ReviewContextBundle(
+        workspace_id=args.workspace_id,
+        patch_text=diff_text,
+        base_sha=str(metadata.get("diff_refs", {}).get("base_sha", "")),
+        head_sha=str(metadata.get("diff_refs", {}).get("head_sha", "")),
+        target_branch_head_sha=str(metadata.get("diff_refs", {}).get("start_sha", "")),
+        merge_preview_sha=str(metadata.get("merge_commit_sha", "") or ""),
+        pr_metadata={
+            "mr_id": str(metadata.get("iid", "")),
+            "pr_id": str(metadata.get("iid", "")),
+            "title": str(metadata.get("title", "")),
+            "source_branch": str(metadata.get("source_branch", "")),
+            "target_branch": str(metadata.get("target_branch", "")),
+            "web_url": str(metadata.get("web_url", "")),
+        },
+    )
+    return diff_text, bundle
 
 
 def _load_context_bundle(args: argparse.Namespace) -> ReviewContextBundle | None:

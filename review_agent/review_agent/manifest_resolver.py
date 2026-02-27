@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path, PurePosixPath
 from typing import Optional
+
+logger = logging.getLogger("review_agent.manifest_resolver")
 
 import yaml
 from pydantic import BaseModel, Field, model_validator

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel
 
 from review_agent.models import ReviewContextBundle, ReviewRequest, Severity
+
+logger = logging.getLogger("review_agent.context_ingestion")
 
 
 class IngestedReviewContext(BaseModel):
@@ -13,7 +17,7 @@ class IngestedReviewContext(BaseModel):
     bundle: ReviewContextBundle
     fail_on_severity: Severity
     max_symbols: int
-    max_tool_rounds: int
+    max_symbol_slots: int
     max_total_tool_calls: int
     parse_timeout_s: int
     parse_workers: int
@@ -28,7 +32,7 @@ class ReviewContextIngestor:
 
     _INT_POLICY_KEYS = {
         "max_symbols",
-        "max_tool_rounds",
+        "max_symbol_slots",
         "max_total_tool_calls",
         "parse_timeout_s",
         "parse_workers",
@@ -59,13 +63,16 @@ class ReviewContextIngestor:
 
         values = {
             "max_symbols": request.max_symbols,
-            "max_tool_rounds": request.max_tool_rounds,
+            "max_symbol_slots": request.max_symbol_slots,
             "max_total_tool_calls": request.max_total_tool_calls,
             "parse_timeout_s": request.parse_timeout_s,
             "parse_workers": request.parse_workers,
             "max_candidates_per_symbol": request.max_candidates_per_symbol,
             "max_fetch_limit": request.max_fetch_limit,
         }
+        # Support deprecated policy key "max_tool_rounds" as alias
+        if "max_tool_rounds" in policy and "max_symbol_slots" not in policy:
+            policy["max_symbol_slots"] = policy["max_tool_rounds"]
         for key in cls._INT_POLICY_KEYS:
             if key in policy:
                 try:
@@ -77,7 +84,7 @@ class ReviewContextIngestor:
             bundle=bundle,
             fail_on_severity=fail,
             max_symbols=max(1, values["max_symbols"]),
-            max_tool_rounds=max(1, values["max_tool_rounds"]),
+            max_symbol_slots=max(1, values["max_symbol_slots"]),
             max_total_tool_calls=max(1, values["max_total_tool_calls"]),
             parse_timeout_s=max(1, values["parse_timeout_s"]),
             parse_workers=max(1, values["parse_workers"]),

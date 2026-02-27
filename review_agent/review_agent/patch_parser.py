@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from pathlib import PurePosixPath
+
+logger = logging.getLogger("review_agent.patch_parser")
 
 from review_agent.models import (
     HunkLine,

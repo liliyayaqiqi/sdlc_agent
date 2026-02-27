@@ -320,12 +320,13 @@ class ReviewRequest(BaseModel):
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
     max_symbols: int = 24
-    max_tool_rounds: int = 30
+    max_symbol_slots: int = 30
     max_total_tool_calls: int = 120
     parse_timeout_s: int = 120
     parse_workers: int = 4
     max_candidates_per_symbol: int = 150
     max_fetch_limit: int = 2000
+    review_timeout_s: int = 0
     enable_cache: bool = True
     cache_dir: str = ".review_agent_cache"
 
