@@ -5,12 +5,13 @@ Standalone, CI-first AI code review agent for C++ pull requests.
 ## What it does
 
 1. Accepts either a legacy patch input or a PR/MR context bundle.
-2. Runs deterministic pre-pass extraction before LLM synthesis.
-3. Uses two LLM stages (planning + synthesis) on top of deterministic evidence.
-4. Calls CXXtract2 macro tools and `/explore/*` primitives for bounded evidence collection:
-   - `/agent/investigate-symbol`
-   - `/agent/search-analyze-recent-commits`
-   - `/agent/read-file-context`
+2. Runs deterministic pre-pass extraction (seed symbols, suspicious anchors,
+   changed methods, call-site deltas) before any LLM reasoning.
+3. Uses three LLM stages on top of deterministic evidence:
+   - **Planner** -- produces a bounded review plan from pre-pass signals
+   - **Exploration** -- agent-driven follow-up with 6 explore tools
+   - **Synthesis** -- produces findings from the fact sheet
+4. Calls CXXtract2 `/explore/*` primitives for bounded evidence collection:
    - `/explore/rg-search`
    - `/explore/list-candidates`
    - `/explore/classify-freshness`
@@ -18,10 +19,19 @@ Standalone, CI-first AI code review agent for C++ pull requests.
    - `/explore/fetch-symbols`
    - `/explore/fetch-references`
    - `/explore/fetch-call-edges`
-5. Produces:
+   - `/explore/read-file`
+   - `/explore/get-confidence`
+5. Falls back to macro tools when explore primitives yield no results:
+   - `/agent/investigate-symbol`
+6. Performs merge-aware review when baseline/head/merge-preview contexts
+   are available.
+7. Runs semantic test impact analysis using call-edge traversal.
+8. Enforces budget knobs (max_symbols, max_tool_rounds,
+   max_total_tool_calls, etc.) across all stages.
+9. Produces:
    - `review_report.md`
    - `review_report.json`
-6. Returns a CI-friendly exit code based on configured severity threshold.
+10. Returns a CI-friendly exit code based on configured severity threshold.
 
 ## Quick start
 

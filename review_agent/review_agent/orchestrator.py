@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha1
 import os
 from pathlib import Path
@@ -30,8 +30,10 @@ from review_agent.models import (
 )
 from review_agent.patch_parser import build_prepass_result, parse_unified_diff
 from review_agent.prompting import (
+    EXPLORATION_SYSTEM_PROMPT,
     PLANNER_SYSTEM_PROMPT,
     SYNTHESIS_SYSTEM_PROMPT,
+    build_exploration_prompt,
     build_planner_prompt,
     build_synthesis_prompt,
 )
@@ -40,6 +42,56 @@ from review_agent.review_cache import ReviewTraceCache
 from review_agent.tool_clients.cxxtract_http_client import CxxtractHttpClient
 
 
+# ---------------------------------------------------------------------------
+# Budget tracking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BudgetTracker:
+    """Mutable budget counters shared across the entire review run."""
+
+    max_tool_rounds: int
+    max_total_tool_calls: int
+    max_symbols: int
+    max_candidates_per_symbol: int
+    max_fetch_limit: int
+    parse_timeout_s: int
+    parse_workers: int
+
+    rounds_used: int = 0
+    calls_used: int = 0
+
+    @property
+    def remaining_rounds(self) -> int:
+        return max(0, self.max_tool_rounds - self.rounds_used)
+
+    @property
+    def remaining_calls(self) -> int:
+        return max(0, self.max_total_tool_calls - self.calls_used)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining_calls <= 0
+
+    def consume_call(self) -> bool:
+        """Try to consume one call.  Returns False if budget exhausted."""
+        if self.calls_used >= self.max_total_tool_calls:
+            return False
+        self.calls_used += 1
+        return True
+
+    def consume_round(self) -> bool:
+        """Try to consume one round.  Returns False if budget exhausted."""
+        if self.rounds_used >= self.max_tool_rounds:
+            return False
+        self.rounds_used += 1
+        return True
+
+
+# ---------------------------------------------------------------------------
+# View context container
+# ---------------------------------------------------------------------------
+
 @dataclass
 class ViewContexts:
     baseline: dict[str, Any]
@@ -47,6 +99,10 @@ class ViewContexts:
     merge_preview: dict[str, Any] | None
     status: ViewContextMaterialization
 
+
+# ---------------------------------------------------------------------------
+# Agent factories
+# ---------------------------------------------------------------------------
 
 def build_planner_agent(model_name: str):
     from pydantic_ai import Agent  # type: ignore
@@ -59,6 +115,175 @@ def build_synthesis_agent(model_name: str):
 
     return Agent(model_name, system_prompt=SYNTHESIS_SYSTEM_PROMPT, result_type=ReviewReport)
 
+
+def build_exploration_agent(
+    model_name: str,
+    *,
+    client: CxxtractHttpClient,
+    budget: BudgetTracker,
+    tool_usage: list[ToolCallRecord],
+    analysis_context: dict[str, Any],
+):
+    """Build a PydanticAI agent with the 6 explore tools registered."""
+    from pydantic_ai import Agent, RunContext  # type: ignore
+
+    @dataclass
+    class ExploreDeps:
+        client: CxxtractHttpClient
+        budget: BudgetTracker
+        tool_usage: list[ToolCallRecord]
+        analysis_context: dict[str, Any]
+
+    agent = Agent(
+        model_name,
+        system_prompt=EXPLORATION_SYSTEM_PROMPT,
+        deps_type=ExploreDeps,
+        result_type=str,
+    )
+
+    def _record(deps: ExploreDeps, tool_name: str, success: bool, elapsed_ms: float, note: str = ""):
+        deps.tool_usage.append(
+            ToolCallRecord(skill="explorer", tool=tool_name, success=success, elapsed_ms=elapsed_ms, note=note)
+        )
+
+    @agent.tool  # type: ignore[misc]
+    def explore_list_candidates(ctx: RunContext[ExploreDeps], symbol: str, max_files: int = 50) -> dict[str, Any]:
+        """Find candidate files that may contain a symbol."""
+        deps = ctx.deps
+        if not deps.budget.consume_call():
+            return {"warning": "budget_exhausted", "candidates": []}
+        t0 = perf_counter()
+        try:
+            capped = min(max_files, deps.budget.max_candidates_per_symbol)
+            result = deps.client.explore_list_candidates(
+                symbol=symbol, max_files=capped, include_rg=True,
+                analysis_context=deps.analysis_context,
+            )
+            _record(deps, "explore.list_candidates", True, (perf_counter() - t0) * 1000)
+            return result
+        except Exception as exc:
+            _record(deps, "explore.list_candidates", False, (perf_counter() - t0) * 1000, str(exc))
+            return {"warning": str(exc), "candidates": []}
+
+    @agent.tool  # type: ignore[misc]
+    def explore_fetch_symbols(ctx: RunContext[ExploreDeps], symbol: str, candidate_file_keys: list[str] | None = None) -> dict[str, Any]:
+        """Look up symbol definitions across candidate files."""
+        deps = ctx.deps
+        if not deps.budget.consume_call():
+            return {"warning": "budget_exhausted", "symbols": []}
+        t0 = perf_counter()
+        try:
+            result = deps.client.explore_fetch_symbols(
+                symbol=symbol,
+                candidate_file_keys=candidate_file_keys or [],
+                excluded_file_keys=[],
+                limit=deps.budget.max_fetch_limit,
+                analysis_context=deps.analysis_context,
+            )
+            _record(deps, "explore.fetch_symbols", True, (perf_counter() - t0) * 1000)
+            return result
+        except Exception as exc:
+            _record(deps, "explore.fetch_symbols", False, (perf_counter() - t0) * 1000, str(exc))
+            return {"warning": str(exc), "symbols": []}
+
+    @agent.tool  # type: ignore[misc]
+    def explore_fetch_references(ctx: RunContext[ExploreDeps], symbol: str, candidate_file_keys: list[str] | None = None) -> dict[str, Any]:
+        """Trace references to a symbol across candidate files."""
+        deps = ctx.deps
+        if not deps.budget.consume_call():
+            return {"warning": "budget_exhausted", "references": []}
+        t0 = perf_counter()
+        try:
+            result = deps.client.explore_fetch_references(
+                symbol=symbol,
+                candidate_file_keys=candidate_file_keys or [],
+                excluded_file_keys=[],
+                limit=deps.budget.max_fetch_limit,
+                analysis_context=deps.analysis_context,
+            )
+            _record(deps, "explore.fetch_references", True, (perf_counter() - t0) * 1000)
+            return result
+        except Exception as exc:
+            _record(deps, "explore.fetch_references", False, (perf_counter() - t0) * 1000, str(exc))
+            return {"warning": str(exc), "references": []}
+
+    @agent.tool  # type: ignore[misc]
+    def explore_fetch_call_edges(ctx: RunContext[ExploreDeps], symbol: str, direction: str = "both", candidate_file_keys: list[str] | None = None) -> dict[str, Any]:
+        """Trace callers and callees of a symbol."""
+        deps = ctx.deps
+        if not deps.budget.consume_call():
+            return {"warning": "budget_exhausted", "edges": []}
+        t0 = perf_counter()
+        try:
+            result = deps.client.explore_fetch_call_edges(
+                symbol=symbol,
+                direction=direction,
+                candidate_file_keys=candidate_file_keys or [],
+                excluded_file_keys=[],
+                limit=deps.budget.max_fetch_limit,
+                analysis_context=deps.analysis_context,
+            )
+            _record(deps, "explore.fetch_call_edges", True, (perf_counter() - t0) * 1000)
+            return result
+        except Exception as exc:
+            _record(deps, "explore.fetch_call_edges", False, (perf_counter() - t0) * 1000, str(exc))
+            return {"warning": str(exc), "edges": []}
+
+    @agent.tool  # type: ignore[misc]
+    def explore_read_file(ctx: RunContext[ExploreDeps], file_key: str, start_line: int = 1, end_line: int = 120) -> dict[str, Any]:
+        """Read source code from a file."""
+        deps = ctx.deps
+        if not deps.budget.consume_call():
+            return {"warning": "budget_exhausted", "content": ""}
+        t0 = perf_counter()
+        try:
+            result = deps.client.explore_read_file(
+                file_key=file_key,
+                start_line=start_line,
+                end_line=end_line,
+                max_bytes=32_000,
+            )
+            _record(deps, "explore.read_file", True, (perf_counter() - t0) * 1000)
+            return result
+        except Exception as exc:
+            _record(deps, "explore.read_file", False, (perf_counter() - t0) * 1000, str(exc))
+            return {"warning": str(exc), "content": ""}
+
+    @agent.tool  # type: ignore[misc]
+    def explore_rg_search(ctx: RunContext[ExploreDeps], query: str, mode: str = "symbol", max_hits: int = 50) -> dict[str, Any]:
+        """Search for text/symbols across the workspace."""
+        deps = ctx.deps
+        if not deps.budget.consume_call():
+            return {"warning": "budget_exhausted", "hits": []}
+        t0 = perf_counter()
+        try:
+            result = deps.client.explore_rg_search(
+                query=query,
+                mode=mode,
+                max_hits=min(max_hits, 200),
+                max_files=min(50, deps.budget.max_candidates_per_symbol),
+                timeout_s=min(deps.budget.parse_timeout_s, 30),
+                context_lines=1,
+                analysis_context=deps.analysis_context,
+            )
+            _record(deps, "explore.rg_search", True, (perf_counter() - t0) * 1000)
+            return result
+        except Exception as exc:
+            _record(deps, "explore.rg_search", False, (perf_counter() - t0) * 1000, str(exc))
+            return {"warning": str(exc), "hits": []}
+
+    deps = ExploreDeps(
+        client=client,
+        budget=budget,
+        tool_usage=tool_usage,
+        analysis_context=analysis_context,
+    )
+    return agent, deps
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 class ReviewOrchestrator:
     def __init__(
@@ -106,6 +331,16 @@ class ReviewOrchestrator:
         views = self._prepare_views(client=client, runtime_context=bundle, lock_root=runtime.cache_dir)
         tool_usage: list[ToolCallRecord] = []
 
+        budget = BudgetTracker(
+            max_tool_rounds=runtime.max_tool_rounds,
+            max_total_tool_calls=runtime.max_total_tool_calls,
+            max_symbols=runtime.max_symbols,
+            max_candidates_per_symbol=runtime.max_candidates_per_symbol,
+            max_fetch_limit=runtime.max_fetch_limit,
+            parse_timeout_s=runtime.parse_timeout_s,
+            parse_workers=runtime.parse_workers,
+        )
+
         cache = ReviewTraceCache(runtime.cache_dir) if runtime.enable_cache else None
         cache_key = ""
         if cache is not None:
@@ -131,6 +366,7 @@ class ReviewOrchestrator:
             if cached is not None:
                 return cached
 
+        # --- Step 1: LLM Planner ---
         planner = self._planner_for(request.llm_model)
         planner_prompt = build_planner_prompt(
             context=bundle,
@@ -150,7 +386,13 @@ class ReviewOrchestrator:
         except Exception:
             plan = ReviewPlan(prioritized_symbols=[s.symbol for s in prepass.seed_symbols[: runtime.max_symbols]])
 
-        impacts, symbol_facts, coverage = self._collect_evidence(client, runtime, views, prepass, plan, tool_usage)
+        # --- Step 2: Deterministic base evidence collection ---
+        impacts, symbol_facts, coverage = self._collect_evidence(client, runtime, views, prepass, plan, tool_usage, budget)
+
+        # --- Step 3: Build merge delta signals ---
+        merge_delta_signals = _build_merge_delta_signals(symbol_facts, views)
+
+        # --- Step 4: Build initial fact sheet ---
         fact_sheet = ReviewFactSheet(
             changed_files=prepass.changed_files,
             changed_hunk_count=prepass.changed_hunk_count,
@@ -164,10 +406,37 @@ class ReviewOrchestrator:
             evidence_anchors=[ev for impact in impacts for ev in _anchors_from_impact(impact)][:400],
             coverage=coverage,
             view_contexts=views.status,
+            merge_delta_signals=merge_delta_signals,
             warnings=sorted(set(prepass.warnings + views.status.warnings + coverage.warnings)),
         )
-        test_impact = _build_test_impact(prepass=prepass, impacts=impacts)
 
+        # --- Step 5: Agent-driven follow-up exploration ---
+        if budget.remaining_calls > 0 and budget.remaining_rounds > 0:
+            followup_evidence = self._agent_follow_up(
+                model_name=request.llm_model,
+                client=client,
+                budget=budget,
+                tool_usage=tool_usage,
+                fact_sheet=fact_sheet,
+                prepass=prepass,
+                views=views,
+            )
+            # Merge follow-up evidence anchors into fact sheet
+            if followup_evidence:
+                existing_anchors = list(fact_sheet.evidence_anchors)
+                existing_anchors.extend(followup_evidence[:100])
+                fact_sheet = fact_sheet.model_copy(update={
+                    "evidence_anchors": existing_anchors[:500],
+                    "warnings": sorted(set(fact_sheet.warnings + ["agent_followup_executed"])),
+                })
+
+        # --- Step 6: Test impact analysis ---
+        test_impact = _analyze_test_impact(
+            prepass=prepass, impacts=impacts, client=client, views=views,
+            budget=budget, tool_usage=tool_usage,
+        )
+
+        # --- Step 7: LLM Synthesis ---
         synth = self._synthesis_for(request.llm_model)
         try:
             draft = synth.run_sync(
@@ -187,6 +456,7 @@ class ReviewOrchestrator:
                 tool_usage=tool_usage,
             )
 
+        # --- Step 8: Policy gate ---
         final = _policy_gate(
             report=draft,
             fact_sheet=fact_sheet,
@@ -298,19 +568,20 @@ class ReviewOrchestrator:
         prepass,
         plan: ReviewPlan,
         tool_usage: list[ToolCallRecord],
+        budget: BudgetTracker,
     ) -> tuple[list[SymbolImpact], list[SymbolFact], CoverageSummary]:
-        symbols = list(dict.fromkeys(plan.prioritized_symbols + [s.symbol for s in prepass.seed_symbols]))[: runtime.max_symbols]
+        symbols = list(dict.fromkeys(plan.prioritized_symbols + [s.symbol for s in prepass.seed_symbols]))[: budget.max_symbols]
         impacts: list[SymbolImpact] = []
         facts: list[SymbolFact] = []
         for idx, symbol in enumerate(symbols):
-            if idx >= runtime.max_tool_rounds or len(tool_usage) >= runtime.max_total_tool_calls:
+            if not budget.consume_round() or budget.exhausted:
                 break
-            impact = _collect_symbol(client, runtime, views.head, symbol, tool_usage)
+            impact = _collect_symbol(client, runtime, views.head, symbol, tool_usage, budget)
             impacts.append(impact)
-            base_refs, base_edges = _fetch_counts(client, runtime, views.baseline, symbol, impact, tool_usage)
+            base_refs, base_edges = _fetch_counts(client, runtime, views.baseline, symbol, impact, tool_usage, budget)
             merge_refs, merge_edges = (0, 0)
             if views.merge_preview is not None:
-                merge_refs, merge_edges = _fetch_counts(client, runtime, views.merge_preview, symbol, impact, tool_usage)
+                merge_refs, merge_edges = _fetch_counts(client, runtime, views.merge_preview, symbol, impact, tool_usage, budget)
             facts.append(
                 SymbolFact(
                     symbol=symbol,
@@ -329,6 +600,53 @@ class ReviewOrchestrator:
             )
         return impacts, facts, _coverage(impacts)
 
+    def _agent_follow_up(
+        self,
+        *,
+        model_name: str,
+        client: CxxtractHttpClient,
+        budget: BudgetTracker,
+        tool_usage: list[ToolCallRecord],
+        fact_sheet: ReviewFactSheet,
+        prepass,
+        views: ViewContexts,
+    ) -> list[EvidenceRef]:
+        """Run agent-driven follow-up exploration with remaining budget."""
+        if budget.remaining_calls < 2 or budget.remaining_rounds < 1:
+            return []
+
+        prompt = build_exploration_prompt(
+            fact_sheet=fact_sheet,
+            prepass=prepass,
+            remaining_calls=budget.remaining_calls,
+            remaining_rounds=budget.remaining_rounds,
+        )
+
+        try:
+            agent, deps = build_exploration_agent(
+                model_name,
+                client=client,
+                budget=budget,
+                tool_usage=tool_usage,
+                analysis_context=views.head,
+            )
+            result = agent.run_sync(prompt, deps=deps)
+            summary_text = str(result.data or "")
+        except Exception:
+            return []
+
+        # Convert the exploration summary to evidence anchors
+        evidence: list[EvidenceRef] = []
+        if summary_text.strip():
+            evidence.append(
+                EvidenceRef(
+                    tool="agent.exploration_followup",
+                    description="agent_exploration_summary",
+                    snippet=summary_text[:500],
+                )
+            )
+        return evidence
+
     @staticmethod
     def write_report_files(report: ReviewReport, out_dir: str | Path) -> tuple[Path, Path]:
         out = Path(out_dir).resolve()
@@ -340,19 +658,23 @@ class ReviewOrchestrator:
         return md_path, json_path
 
 
-def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: list[ToolCallRecord]) -> SymbolImpact:
+# ---------------------------------------------------------------------------
+# Deterministic evidence collection (per-symbol)
+# ---------------------------------------------------------------------------
+
+def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: list[ToolCallRecord], budget: BudgetTracker) -> SymbolImpact:
     rg = _call(
         tool_usage,
-        runtime.max_total_tool_calls,
+        budget,
         "collector",
         "explore.rg_search",
         client.explore_rg_search,
         query=symbol,
         mode="symbol",
         analysis_context=analysis_context,
-        max_hits=min(runtime.max_fetch_limit, 200),
-        max_files=min(runtime.max_candidates_per_symbol, 200),
-        timeout_s=min(runtime.parse_timeout_s, 60),
+        max_hits=min(budget.max_fetch_limit, 200),
+        max_files=min(budget.max_candidates_per_symbol, 200),
+        timeout_s=min(budget.parse_timeout_s, 60),
         context_lines=1,
     )
     rg_hits = list(rg.get("hits", []) or [])
@@ -360,17 +682,17 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
 
     listed = _call(
         tool_usage,
-        runtime.max_total_tool_calls,
+        budget,
         "collector",
         "explore.list_candidates",
         client.explore_list_candidates,
         symbol=symbol,
-        max_files=runtime.max_candidates_per_symbol,
+        max_files=budget.max_candidates_per_symbol,
         include_rg=True,
         analysis_context=analysis_context,
     )
     listed_candidates = list(listed.get("candidates", []) or [])
-    candidates = _dedupe_file_keys(rg_candidates + listed_candidates)[: runtime.max_candidates_per_symbol]
+    candidates = _dedupe_file_keys(rg_candidates + listed_candidates)[: budget.max_candidates_per_symbol]
     deleted = _dedupe_file_keys(list(listed.get("deleted_file_keys", []) or []))
 
     read_contexts: list[dict[str, Any]] = []
@@ -381,7 +703,7 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
         line = int(hit.get("line", 1) or 1)
         row = _call(
             tool_usage,
-            runtime.max_total_tool_calls,
+            budget,
             "collector",
             "explore.read_file",
             client.explore_read_file,
@@ -395,7 +717,7 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
     if not read_contexts and candidates:
         row = _call(
             tool_usage,
-            runtime.max_total_tool_calls,
+            budget,
             "collector",
             "explore.read_file",
             client.explore_read_file,
@@ -407,22 +729,22 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
         if row.get("content"):
             read_contexts.append(row)
 
-    freshness = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.classify_freshness", client.explore_classify_freshness, candidate_file_keys=candidates, max_files=max(1, len(candidates)), analysis_context=analysis_context)
+    freshness = _call(tool_usage, budget, "collector", "explore.classify_freshness", client.explore_classify_freshness, candidate_file_keys=candidates, max_files=max(1, len(candidates)), analysis_context=analysis_context)
     stale = list(freshness.get("stale", []) or [])
     fresh = list(freshness.get("fresh", []) or [])
     unparsed = list(freshness.get("unparsed", []) or [])
-    parsed = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.parse_file", client.explore_parse_file, file_keys=stale, max_parse_workers=runtime.parse_workers, timeout_s=runtime.parse_timeout_s, skip_if_fresh=True, analysis_context=analysis_context)
+    parsed = _call(tool_usage, budget, "collector", "explore.parse_file", client.explore_parse_file, file_keys=stale, max_parse_workers=budget.parse_workers, timeout_s=budget.parse_timeout_s, skip_if_fresh=True, analysis_context=analysis_context)
     parsed_keys = list(parsed.get("parsed_file_keys", []) or [])
     parse_failed = list(parsed.get("failed_file_keys", []) or [])
-    sym_rows = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.fetch_symbols", client.explore_fetch_symbols, symbol=symbol, candidate_file_keys=candidates, excluded_file_keys=deleted, limit=runtime.max_fetch_limit, analysis_context=analysis_context)
-    ref_rows = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.fetch_references", client.explore_fetch_references, symbol=symbol, candidate_file_keys=candidates, excluded_file_keys=deleted, limit=runtime.max_fetch_limit, analysis_context=analysis_context)
-    edge_rows = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.fetch_call_edges", client.explore_fetch_call_edges, symbol=symbol, direction="both", candidate_file_keys=candidates, excluded_file_keys=deleted, limit=runtime.max_fetch_limit, analysis_context=analysis_context)
-    conf = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.get_confidence", client.explore_get_confidence, verified_files=sorted(set(fresh + parsed_keys)), stale_files=sorted(set(parse_failed)), unparsed_files=sorted(set(unparsed + list(parsed.get("unparsed_file_keys", []) or []))), warnings=[], overlay_mode=str(freshness.get("overlay_mode", "sparse")))
+    sym_rows = _call(tool_usage, budget, "collector", "explore.fetch_symbols", client.explore_fetch_symbols, symbol=symbol, candidate_file_keys=candidates, excluded_file_keys=deleted, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+    ref_rows = _call(tool_usage, budget, "collector", "explore.fetch_references", client.explore_fetch_references, symbol=symbol, candidate_file_keys=candidates, excluded_file_keys=deleted, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+    edge_rows = _call(tool_usage, budget, "collector", "explore.fetch_call_edges", client.explore_fetch_call_edges, symbol=symbol, direction="both", candidate_file_keys=candidates, excluded_file_keys=deleted, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+    conf = _call(tool_usage, budget, "collector", "explore.get_confidence", client.explore_get_confidence, verified_files=sorted(set(fresh + parsed_keys)), stale_files=sorted(set(parse_failed)), unparsed_files=sorted(set(unparsed + list(parsed.get("unparsed_file_keys", []) or []))), warnings=[], overlay_mode=str(freshness.get("overlay_mode", "sparse")))
     macro_summary = ""
     if not list(ref_rows.get("references", []) or []) and not list(edge_rows.get("edges", []) or []):
         macro = _call(
             tool_usage,
-            runtime.max_total_tool_calls,
+            budget,
             "collector",
             "agent.investigate_symbol",
             client.agent_investigate_symbol,
@@ -463,9 +785,9 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
     )
 
 
-def _fetch_counts(client, runtime, analysis_context, symbol: str, impact: SymbolImpact, tool_usage: list[ToolCallRecord]) -> tuple[int, int]:
-    refs = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.fetch_references", client.explore_fetch_references, symbol=symbol, candidate_file_keys=impact.candidate_file_keys, excluded_file_keys=impact.deleted_file_keys, limit=runtime.max_fetch_limit, analysis_context=analysis_context)
-    edges = _call(tool_usage, runtime.max_total_tool_calls, "collector", "explore.fetch_call_edges", client.explore_fetch_call_edges, symbol=symbol, direction="both", candidate_file_keys=impact.candidate_file_keys, excluded_file_keys=impact.deleted_file_keys, limit=runtime.max_fetch_limit, analysis_context=analysis_context)
+def _fetch_counts(client, runtime, analysis_context, symbol: str, impact: SymbolImpact, tool_usage: list[ToolCallRecord], budget: BudgetTracker) -> tuple[int, int]:
+    refs = _call(tool_usage, budget, "collector", "explore.fetch_references", client.explore_fetch_references, symbol=symbol, candidate_file_keys=impact.candidate_file_keys, excluded_file_keys=impact.deleted_file_keys, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+    edges = _call(tool_usage, budget, "collector", "explore.fetch_call_edges", client.explore_fetch_call_edges, symbol=symbol, direction="both", candidate_file_keys=impact.candidate_file_keys, excluded_file_keys=impact.deleted_file_keys, limit=budget.max_fetch_limit, analysis_context=analysis_context)
     return len(list(refs.get("references", []) or [])), len(list(edges.get("edges", []) or []))
 
 
@@ -481,9 +803,9 @@ def _dedupe_file_keys(values: list[str]) -> list[str]:
     return out
 
 
-def _call(tool_usage: list[ToolCallRecord], max_calls: int, skill: str, tool: str, fn, **kwargs: Any) -> dict[str, Any]:
-    if len(tool_usage) >= max_calls:
-        return {"warnings": [f"max_total_tool_calls_reached:{max_calls}"]}
+def _call(tool_usage: list[ToolCallRecord], budget: BudgetTracker, skill: str, tool: str, fn, **kwargs: Any) -> dict[str, Any]:
+    if not budget.consume_call():
+        return {"warnings": [f"max_total_tool_calls_reached:{budget.max_total_tool_calls}"]}
     t0 = perf_counter()
     try:
         data = fn(**kwargs)
@@ -493,6 +815,10 @@ def _call(tool_usage: list[ToolCallRecord], max_calls: int, skill: str, tool: st
         tool_usage.append(ToolCallRecord(skill=skill, tool=tool, success=False, elapsed_ms=(perf_counter() - t0) * 1000.0, note=str(exc)))
         return {"warnings": [f"{tool}_failed:{exc}"]}
 
+
+# ---------------------------------------------------------------------------
+# Evidence helpers
+# ---------------------------------------------------------------------------
 
 def _anchors_from_impact(impact: SymbolImpact) -> list[EvidenceRef]:
     lexical = [
@@ -556,15 +882,105 @@ def _coverage(impacts: list[SymbolImpact]) -> CoverageSummary:
     )
 
 
-def _build_test_impact(*, prepass, impacts: list[SymbolImpact]) -> TestImpact:
+# ---------------------------------------------------------------------------
+# Merge delta signals
+# ---------------------------------------------------------------------------
+
+def _build_merge_delta_signals(symbol_facts: list[SymbolFact], views: ViewContexts) -> list[dict[str, Any]]:
+    """Flag symbols where merge-preview counts differ from both head and baseline."""
+    if views.merge_preview is None or not views.status.merge_preview_materialized:
+        return []
+    signals: list[dict[str, Any]] = []
+    for sf in symbol_facts:
+        if not sf.merge_preview_reference_count and not sf.merge_preview_call_edge_count:
+            continue
+        merge_ref_delta_vs_head = sf.merge_preview_reference_count - sf.head_reference_count
+        merge_edge_delta_vs_head = sf.merge_preview_call_edge_count - sf.head_call_edge_count
+        # Signal when merge introduces changes not present in head
+        if merge_ref_delta_vs_head != 0 or merge_edge_delta_vs_head != 0:
+            signals.append({
+                "symbol": sf.symbol,
+                "head_refs": sf.head_reference_count,
+                "baseline_refs": sf.baseline_reference_count,
+                "merge_refs": sf.merge_preview_reference_count,
+                "merge_ref_delta_vs_head": merge_ref_delta_vs_head,
+                "head_edges": sf.head_call_edge_count,
+                "baseline_edges": sf.baseline_call_edge_count,
+                "merge_edges": sf.merge_preview_call_edge_count,
+                "merge_edge_delta_vs_head": merge_edge_delta_vs_head,
+                "risk": "merge_introduces_new_interaction" if (
+                    merge_ref_delta_vs_head != 0
+                    and sf.reference_delta_vs_baseline != merge_ref_delta_vs_head
+                ) else "merge_count_shift",
+            })
+    return signals[:50]
+
+
+# ---------------------------------------------------------------------------
+# Test impact analysis
+# ---------------------------------------------------------------------------
+
+def _analyze_test_impact(
+    *,
+    prepass,
+    impacts: list[SymbolImpact],
+    client: CxxtractHttpClient,
+    views: ViewContexts,
+    budget: BudgetTracker,
+    tool_usage: list[ToolCallRecord],
+) -> TestImpact:
+    """Build test impact using path heuristics + call-edge traversal + semantic lookup."""
+    # 1. Directly impacted: changed files that are tests
     direct = sorted({p for p in prepass.changed_files if _looks_like_test_path(p)})
+
+    # 2. Likely impacted via call edges from already-collected impacts
     likely: set[str] = set()
+    dependency_edges: list[dict[str, Any]] = []
     for impact in impacts:
         for row in impact.references + impact.call_edges:
             fk = str(row.get("file_key", ""))
             rel = fk.split(":", 1)[1] if ":" in fk else ""
             if rel and _looks_like_test_path(rel):
                 likely.add(rel)
+                dependency_edges.append({
+                    "symbol": impact.symbol,
+                    "test_file": rel,
+                    "file_key": fk,
+                    "source": "call_edge_or_reference",
+                    "line": int(row.get("line", 0) or 0),
+                })
+
+    # 3. Semantic test dependency: for top changed methods, fetch references to find test files
+    semantic_test_files: set[str] = set()
+    methods_to_check = prepass.changed_methods[:10]
+    for method in methods_to_check:
+        if budget.exhausted:
+            break
+        refs = _call(
+            tool_usage, budget, "test_impact", "explore.fetch_references",
+            client.explore_fetch_references,
+            symbol=method,
+            candidate_file_keys=[],
+            excluded_file_keys=[],
+            limit=min(budget.max_fetch_limit, 100),
+            analysis_context=views.head,
+        )
+        for ref in list(refs.get("references", []) or []):
+            fk = str(ref.get("file_key", ""))
+            rel = fk.split(":", 1)[1] if ":" in fk else ""
+            if rel and _looks_like_test_path(rel) and rel not in likely:
+                semantic_test_files.add(rel)
+                dependency_edges.append({
+                    "symbol": method,
+                    "test_file": rel,
+                    "file_key": fk,
+                    "source": "semantic_method_reference",
+                    "line": int(ref.get("line", 0) or 0),
+                })
+
+    likely.update(semantic_test_files)
+
+    # 4. Suggested scopes with confidence
     scopes = ["smoke"]
     if direct:
         scopes.append("unit")
@@ -572,13 +988,38 @@ def _build_test_impact(*, prepass, impacts: list[SymbolImpact]) -> TestImpact:
         scopes.append("integration")
     if any(len(impact.repos_involved) > 1 for impact in impacts):
         scopes.append("e2e")
+
+    # 5. Confidence scoring
+    if direct and likely and semantic_test_files:
+        confidence = 0.9
+    elif direct and likely:
+        confidence = 0.75
+    elif direct:
+        confidence = 0.6
+    elif likely:
+        confidence = 0.5
+    else:
+        confidence = 0.3
+
+    rationale = ["deterministic_test_impact"]
+    if semantic_test_files:
+        rationale.append(f"semantic_method_trace:{len(semantic_test_files)}_test_files")
+    if dependency_edges:
+        rationale.append(f"call_edge_trace:{len(dependency_edges)}_edges")
+
     return TestImpact(
         directly_impacted_tests=direct[:200],
         likely_impacted_tests=sorted([p for p in likely if p not in set(direct)])[:300],
         suggested_scopes=list(dict.fromkeys(scopes)),
-        rationale=["deterministic_test_impact"],
+        rationale=rationale,
+        confidence=round(confidence, 2),
+        test_dependency_edges=dependency_edges[:200],
     )
 
+
+# ---------------------------------------------------------------------------
+# Policy gate
+# ---------------------------------------------------------------------------
 
 def _policy_gate(*, report: ReviewReport, fact_sheet: ReviewFactSheet, test_impact: TestImpact, fail_threshold: Severity, tool_usage: list[ToolCallRecord], workspace_id: str) -> ReviewReport:
     findings: list[ReviewFinding] = []
@@ -607,6 +1048,10 @@ def _policy_gate(*, report: ReviewReport, fact_sheet: ReviewFactSheet, test_impa
     summary = report.summary.strip() or f"Reviewed {len(fact_sheet.changed_files)} files; findings={len(findings)}."
     return report.model_copy(update={"workspace_id": workspace_id, "summary": summary, "findings": findings, "coverage": fact_sheet.coverage, "decision": ReviewDecision(fail_threshold=fail_threshold, blocking_findings=blocking, should_block=should_block), "tool_usage": tool_usage, "fact_sheet": fact_sheet, "test_impact": test_impact})
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _fid(*parts: str) -> str:
     return sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]

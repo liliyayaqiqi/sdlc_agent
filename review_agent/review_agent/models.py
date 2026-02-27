@@ -264,6 +264,7 @@ class ReviewFactSheet(BaseModel):
     evidence_anchors: list[EvidenceRef] = Field(default_factory=list)
     coverage: CoverageSummary = Field(default_factory=CoverageSummary)
     view_contexts: ViewContextMaterialization = Field(default_factory=ViewContextMaterialization)
+    merge_delta_signals: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -274,6 +275,8 @@ class TestImpact(BaseModel):
     likely_impacted_tests: list[str] = Field(default_factory=list)
     suggested_scopes: list[str] = Field(default_factory=list)
     rationale: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    test_dependency_edges: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ReviewReport(BaseModel):
