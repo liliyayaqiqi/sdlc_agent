@@ -13,11 +13,11 @@ from pydantic import BaseModel, Field, model_validator
 # Version constants
 # ---------------------------------------------------------------------------
 
-AGENT_VERSION = "0.3.0"
+AGENT_VERSION = "0.3.1"
 PROMPT_VERSION = "2026-02-28"
 PARSER_VERSION = "1"
 
-SUPPORTED_MODEL_PROVIDERS = {"openai", "fixture"}
+SUPPORTED_MODEL_PROVIDERS = {"openai", "openrouter", "gateway", "openai-compatible", "fixture"}
 
 ReviewConfidence = Literal["high", "medium", "low"]
 FindingLocationSide = Literal["new", "old"]
@@ -501,6 +501,10 @@ class ReviewRequest(BaseModel):
     patch_text: str = ""
     context_bundle: ReviewContextBundle | None = None
     llm_model: str = "openai:gpt-4o"
+    llm_base_url: str = ""
+    llm_api_key: str = Field(default="", repr=False)
+    llm_app_url: str = ""
+    llm_app_title: str = ""
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
     max_symbols: int = 24
@@ -529,4 +533,8 @@ class ReviewRequest(BaseModel):
             raise ValueError(
                 f"unsupported llm provider '{provider}'; supported providers: {sorted(SUPPORTED_MODEL_PROVIDERS)}"
             )
+        if ":" not in model_name:
+            raise ValueError("llm_model must be in '<provider>:<model>' format")
+        if provider in {"gateway", "openai-compatible"} and not self.llm_base_url.strip():
+            raise ValueError("llm_base_url is required for gateway/openai-compatible llm providers")
         return self

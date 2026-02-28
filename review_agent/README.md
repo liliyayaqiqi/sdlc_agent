@@ -2,9 +2,11 @@
 
 Standalone, CI-first AI code review agent for C++ pull requests.
 
-Supported production provider in v1: `openai:*`
-
-Deterministic test provider: `fixture:*`
+Supported providers:
+- `openai:*` for direct OpenAI models
+- `openrouter:*` for OpenRouter-routed models
+- `gateway:*` for custom OpenAI-compatible gateways
+- `fixture:*` for deterministic tests
 
 ## What it does
 
@@ -57,7 +59,7 @@ Context-driven mode:
 review-agent run `
   --workspace-id ws_main `
   --context-file F:/path/to/review_context.json `
-  --llm-model openai:gpt-4o `
+  --llm-model openrouter:anthropic/claude-sonnet-4-5 `
   --out-dir ./out
 ```
 
@@ -70,6 +72,26 @@ review-agent run `
   --workspace-fingerprint ws_main:2026-02-28:snapshot `
   --llm-model fixture:default `
   --out-dir ./out
+```
+
+Custom OpenAI-compatible gateway:
+
+```powershell
+$env:REVIEW_AGENT_LLM_MODEL="gateway:claude-sonnet-4-5"
+$env:REVIEW_AGENT_LLM_BASE_URL="https://router.example.com/v1"
+$env:REVIEW_AGENT_LLM_API_KEY="<router-token>"
+
+review-agent run `
+  --workspace-id ws_main `
+  --patch-file F:/path/to/pr.patch `
+  --out-dir ./out
+```
+
+OpenRouter:
+
+```powershell
+$env:REVIEW_AGENT_LLM_MODEL="openrouter:anthropic/claude-sonnet-4-5"
+$env:OPENROUTER_API_KEY="<openrouter-token>"
 ```
 
 ## Environment

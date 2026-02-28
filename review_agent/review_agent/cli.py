@@ -59,6 +59,10 @@ def main(argv: list[str] | None = None) -> int:
         patch_text=patch_text,
         context_bundle=context_bundle,
         llm_model=args.llm_model or settings.llm_model,
+        llm_base_url=args.llm_base_url or settings.llm_base_url,
+        llm_api_key=args.llm_api_key or settings.llm_api_key,
+        llm_app_url=args.llm_app_url or settings.llm_app_url,
+        llm_app_title=args.llm_app_title or settings.llm_app_title,
         cxxtract_base_url=args.cxxtract_base_url or settings.cxxtract_base_url,
         fail_on_severity=fail_on,
         max_symbols=args.max_symbols or settings.max_symbols,
@@ -138,7 +142,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--context-file", default="", help="Path to review context bundle JSON")
     run.add_argument("--context-stdin", action="store_true", default=False, help="Read review context bundle JSON from stdin")
     run.add_argument("--workspace-fingerprint", default="", help="Explicit fingerprint for cache-safe patch-only reviews")
-    run.add_argument("--llm-model", default="", help="Supported model ids: openai:* or fixture:*")
+    run.add_argument(
+        "--llm-model",
+        default="",
+        help="Supported model ids: openai:*, openrouter:*, gateway:* (OpenAI-compatible), or fixture:*",
+    )
+    run.add_argument("--llm-base-url", default="", help="Base URL for gateway/openai-compatible LLM endpoints")
+    run.add_argument("--llm-api-key", default="", help="Explicit API key for gateway/openrouter LLM endpoints")
+    run.add_argument("--llm-app-url", default="", help="Optional OpenRouter app URL")
+    run.add_argument("--llm-app-title", default="", help="Optional OpenRouter app title")
     run.add_argument("--cxxtract-base-url", default="", help="CXXtract API base URL")
     run.add_argument("--fail-on", default="", choices=[s.value for s in Severity], help="CI fail threshold")
     run.add_argument("--out-dir", default="./review_agent_output", help="Output directory for report files")

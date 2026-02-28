@@ -12,7 +12,7 @@ from typing import Any, Callable
 from time import perf_counter, sleep, time
 from uuid import uuid4
 
-from review_agent.adapters.llm import build_model_services
+from review_agent.adapters.llm import build_model_services, endpoint_cache_key
 from review_agent.application.pipeline import ReviewPipeline
 from review_agent.context_ingestion import IngestedReviewContext, ReviewContextIngestor
 from review_agent.domain.location_mapper import FindingLocationMapper
@@ -131,13 +131,13 @@ class ViewContexts:
 # Service compatibility helpers
 # ---------------------------------------------------------------------------
 
-def build_planner_agent(model_name: str):
-    planner, _, _ = build_model_services(model_name)
+def build_planner_agent(model_name: str, **endpoint_kwargs: str):
+    planner, _, _ = build_model_services(model_name, **endpoint_kwargs)
     return planner
 
 
-def build_synthesis_agent(model_name: str):
-    _, _, synthesis = build_model_services(model_name)
+def build_synthesis_agent(model_name: str, **endpoint_kwargs: str):
+    _, _, synthesis = build_model_services(model_name, **endpoint_kwargs)
     return synthesis
 
 
@@ -150,7 +150,7 @@ class ReviewOrchestrator:
         self,
         *,
         client: CxxtractHttpClient | None = None,
-        service_factory: Callable[[str], tuple[Any, Any, Any]] | None = None,
+        service_factory: Callable[[Any], tuple[Any, Any, Any]] | None = None,
     ) -> None:
         self._client = client
         self._service_factory = service_factory or build_model_services
@@ -312,7 +312,7 @@ class ReviewOrchestrator:
                 patch_text=bundle.patch_text,
                 policy={
                     "fail_on_severity": runtime.fail_on_severity.value,
-                    "llm_model": request.llm_model,
+                    "llm_endpoint": endpoint_cache_key(request),
                     "max_symbols": runtime.max_symbols,
                     "max_symbol_slots": runtime.max_symbol_slots,
                     "max_total_tool_calls": runtime.max_total_tool_calls,
@@ -353,7 +353,7 @@ class ReviewOrchestrator:
 
         # --- Step 1: LLM Planner ---
         _check_deadline(deadline, "planner")
-        planner, exploration, synthesis = self._services_for(request.llm_model)
+        planner, exploration, synthesis = self._services_for(request)
         try:
             plan = planner.plan(
                 context=bundle,
@@ -506,10 +506,10 @@ class ReviewOrchestrator:
                 logger.warning("[%s] failed to persist cache: %s", run_id, exc)
         return final
 
-    def _services_for(self, model_name: str) -> tuple[Any, Any, Any]:
-        key = (model_name or "").strip() or "openai:gpt-4o"
+    def _services_for(self, request: ReviewRequest) -> tuple[Any, Any, Any]:
+        key = endpoint_cache_key(request)
         if key not in self._service_cache:
-            self._service_cache[key] = self._service_factory(key)
+            self._service_cache[key] = self._service_factory(request)
         return self._service_cache[key]
 
     def _prepare_views(

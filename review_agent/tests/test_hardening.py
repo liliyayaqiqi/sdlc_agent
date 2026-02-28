@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from review_agent.context_ingestion import ReviewContextIngestor
+from review_agent.adapters.llm import build_model_services, endpoint_cache_key, resolve_llm_endpoint
 from review_agent.domain.location_mapper import FindingLocationMapper
 from review_agent.models import (
     CoverageSummary,
@@ -172,7 +173,7 @@ class TestCache:
             merge_sha="",
             workspace_fingerprint="fp-1",
             patch_text="diff",
-            policy={"llm_model": "fixture:default"},
+            policy={"llm_endpoint": "fixture|default|||"},
         )
         key2 = cache.make_key(
             workspace_id="ws",
@@ -182,9 +183,24 @@ class TestCache:
             merge_sha="",
             workspace_fingerprint="fp-2",
             patch_text="diff",
-            policy={"llm_model": "fixture:default"},
+            policy={"llm_endpoint": "fixture|default|||"},
         )
         assert key1 != key2
+
+    def test_endpoint_cache_key_includes_gateway_base_url(self):
+        req1 = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            llm_model="gateway:router-model",
+            llm_base_url="https://router-a.example/v1",
+        )
+        req2 = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            llm_model="gateway:router-model",
+            llm_base_url="https://router-b.example/v1",
+        )
+        assert endpoint_cache_key(req1) != endpoint_cache_key(req2)
 
     def test_patch_only_cache_disabled_without_fingerprint(self):
         req = ReviewRequest(workspace_id="ws", patch_text="diff --git a/a b/a\n")
@@ -219,7 +235,7 @@ class TestCache:
             patch_text="diff --git a/a b/a\n",
             policy={
                 "fail_on_severity": "high",
-                "llm_model": "fixture:default",
+                "llm_endpoint": "fixture|default|||",
                 "max_symbols": 24,
                 "max_symbol_slots": 30,
                 "max_total_tool_calls": 120,
@@ -227,7 +243,7 @@ class TestCache:
                 "parse_workers": 4,
                 "max_candidates_per_symbol": 150,
                 "max_fetch_limit": 2000,
-                "agent_version": "0.3.0",
+                "agent_version": "0.3.1",
                 "prompt_version": "2026-02-28",
                 "parser_version": "1",
             },
@@ -521,3 +537,37 @@ class TestBackwardCompatibility:
         )
         assert report.run_metadata is not None
         assert report.run_metadata.input_mode == "gitlab_mr"
+
+
+class TestLlmEndpointConfig:
+    def test_openrouter_request_is_valid(self):
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            llm_model="openrouter:anthropic/claude-sonnet-4-5",
+            llm_api_key="token",
+        )
+        endpoint = resolve_llm_endpoint(req)
+        assert endpoint.provider == "openrouter"
+        assert endpoint.model_name == "anthropic/claude-sonnet-4-5"
+
+    def test_gateway_request_requires_base_url(self):
+        with pytest.raises(ValueError, match="llm_base_url is required"):
+            ReviewRequest(
+                workspace_id="ws",
+                patch_text="diff --git a/a b/a\n",
+                llm_model="gateway:claude-sonnet-4-5",
+            )
+
+    def test_build_model_services_accepts_gateway_request(self):
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            llm_model="gateway:claude-sonnet-4-5",
+            llm_base_url="https://router.example/v1",
+            llm_api_key="token",
+        )
+        planner, exploration, synthesis = build_model_services(req)
+        assert planner is not None
+        assert exploration is not None
+        assert synthesis is not None

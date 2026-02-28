@@ -14,6 +14,7 @@ from review_agent.models import (
     ReviewFactSheet,
     ReviewFinding,
     ReviewPlan,
+    ReviewRequest,
     Severity,
     SynthesisDraft,
 )
@@ -27,6 +28,18 @@ from review_agent.prompting import (
 )
 
 logger = logging.getLogger("review_agent.adapters.llm")
+
+
+@dataclass(frozen=True)
+class LlmEndpoint:
+    """Resolved provider configuration for one review run."""
+
+    provider: str
+    model_name: str
+    base_url: str = ""
+    api_key: str = ""
+    app_url: str = ""
+    app_title: str = ""
 
 
 class PlannerService(Protocol):
@@ -64,15 +77,15 @@ class SynthesisService(Protocol):
 class PydanticAiPlannerService:
     """Planner backed by PydanticAI."""
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, endpoint: LlmEndpoint) -> None:
         from pydantic_ai import Agent  # type: ignore
 
-        self._agent = Agent(model_name, system_prompt=PLANNER_SYSTEM_PROMPT, result_type=ReviewPlan)
+        self._agent = Agent(_build_agent_model(endpoint), system_prompt=PLANNER_SYSTEM_PROMPT, output_type=ReviewPlan)
 
     def plan(self, *, context, prepass, budgets: dict[str, int]) -> ReviewPlan:
         try:
             prompt = build_planner_prompt(context=context, prepass=prepass, budgets=budgets)
-            return self._agent.run_sync(prompt).data
+            return _result_output(self._agent.run_sync(prompt), ReviewPlan)
         except Exception as exc:
             raise ModelContractError(str(exc)) from exc
 
@@ -80,15 +93,15 @@ class PydanticAiPlannerService:
 class PydanticAiSynthesisService:
     """Synthesis backed by PydanticAI."""
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, endpoint: LlmEndpoint) -> None:
         from pydantic_ai import Agent  # type: ignore
 
-        self._agent = Agent(model_name, system_prompt=SYNTHESIS_SYSTEM_PROMPT, result_type=SynthesisDraft)
+        self._agent = Agent(_build_agent_model(endpoint), system_prompt=SYNTHESIS_SYSTEM_PROMPT, output_type=SynthesisDraft)
 
     def synthesize(self, *, fact_sheet: ReviewFactSheet, fail_threshold: str) -> SynthesisDraft:
         try:
             prompt = build_synthesis_prompt(fact_sheet=fact_sheet, fail_threshold=fail_threshold)
-            return self._agent.run_sync(prompt).data
+            return _result_output(self._agent.run_sync(prompt), SynthesisDraft)
         except Exception as exc:
             raise ModelContractError(str(exc)) from exc
 
@@ -96,8 +109,8 @@ class PydanticAiSynthesisService:
 class PydanticAiExplorationService:
     """Exploration backed by PydanticAI and real tools."""
 
-    def __init__(self, model_name: str) -> None:
-        self._model_name = model_name
+    def __init__(self, endpoint: LlmEndpoint) -> None:
+        self._endpoint = endpoint
 
     def explore(
         self,
@@ -119,7 +132,7 @@ class PydanticAiExplorationService:
         )
         try:
             agent, deps = _build_exploration_agent(
-                self._model_name,
+                self._endpoint,
                 client=client,
                 budget=budget,
                 tool_usage=tool_usage,
@@ -128,7 +141,7 @@ class PydanticAiExplorationService:
             result = agent.run_sync(prompt, deps=deps)
         except Exception as exc:
             raise ModelContractError(str(exc)) from exc
-        data = result.data
+        data = _result_output(result, ExplorationResult | str)
         if isinstance(data, ExplorationResult):
             return data
         if isinstance(data, str):
@@ -225,26 +238,39 @@ class FixtureSynthesisService:
         return SynthesisDraft(summary=summary, findings=[finding], global_notes=notes)
 
 
-def build_model_services(model_name: str) -> tuple[PlannerService, ExplorationService, SynthesisService]:
+def build_model_services(
+    request_or_model: ReviewRequest | str,
+    *,
+    base_url: str = "",
+    api_key: str = "",
+    app_url: str = "",
+    app_title: str = "",
+) -> tuple[PlannerService, ExplorationService, SynthesisService]:
     """Build typed services for the configured model provider."""
-    normalized = (model_name or "").strip() or "openai:gpt-4o"
-    provider, _, remainder = normalized.partition(":")
+    endpoint = resolve_llm_endpoint(
+        request_or_model,
+        base_url=base_url,
+        api_key=api_key,
+        app_url=app_url,
+        app_title=app_title,
+    )
+    provider = endpoint.provider
     if provider == "fixture":
-        profile = _FixtureProfile(remainder or "default")
+        profile = _FixtureProfile(endpoint.model_name or "default")
         return (
             FixturePlannerService(profile),
             FixtureExplorationService(profile),
             FixtureSynthesisService(profile),
         )
     return (
-        PydanticAiPlannerService(normalized),
-        PydanticAiExplorationService(normalized),
-        PydanticAiSynthesisService(normalized),
+        PydanticAiPlannerService(endpoint),
+        PydanticAiExplorationService(endpoint),
+        PydanticAiSynthesisService(endpoint),
     )
 
 
 def _build_exploration_agent(
-    model_name: str,
+    endpoint: LlmEndpoint,
     *,
     client,
     budget,
@@ -262,10 +288,10 @@ def _build_exploration_agent(
         analysis_context: dict[str, Any]
 
     agent = Agent(
-        model_name,
+        _build_agent_model(endpoint),
         system_prompt=EXPLORATION_SYSTEM_PROMPT,
         deps_type=ExploreDeps,
-        result_type=ExplorationResult,
+        output_type=ExplorationResult,
     )
 
     def _record(deps: ExploreDeps, tool_name: str, success: bool, elapsed_ms: float, note: str = "") -> None:
@@ -382,3 +408,95 @@ def _build_exploration_agent(
         analysis_context=analysis_context,
     )
     return agent, deps
+
+
+def resolve_llm_endpoint(
+    request_or_model: ReviewRequest | str,
+    *,
+    base_url: str = "",
+    api_key: str = "",
+    app_url: str = "",
+    app_title: str = "",
+) -> LlmEndpoint:
+    """Normalize request/config input into one provider endpoint."""
+    if isinstance(request_or_model, ReviewRequest):
+        raw_model = request_or_model.llm_model
+        base_url = request_or_model.llm_base_url
+        api_key = request_or_model.llm_api_key
+        app_url = request_or_model.llm_app_url
+        app_title = request_or_model.llm_app_title
+    else:
+        raw_model = request_or_model
+    normalized = (raw_model or "").strip() or "openai:gpt-4o"
+    if ":" not in normalized:
+        raise ValueError("llm_model must be in '<provider>:<model>' format")
+    provider, _, model_name = normalized.partition(":")
+    normalized_base_url = (base_url or "").strip()
+    if provider in {"gateway", "openai-compatible"} and not normalized_base_url:
+        raise ValueError("llm_base_url is required for gateway/openai-compatible llm providers")
+    return LlmEndpoint(
+        provider=(provider or "openai").strip(),
+        model_name=model_name.strip() or "gpt-4o",
+        base_url=normalized_base_url,
+        api_key=(api_key or "").strip(),
+        app_url=(app_url or "").strip(),
+        app_title=(app_title or "").strip(),
+    )
+
+
+def endpoint_cache_key(request_or_model: ReviewRequest | str, **kwargs: str) -> str:
+    """Stable non-secret cache key fragment for provider selection."""
+    endpoint = resolve_llm_endpoint(request_or_model, **kwargs)
+    return "|".join(
+        [
+            endpoint.provider,
+            endpoint.model_name,
+            endpoint.base_url,
+            endpoint.app_url,
+            endpoint.app_title,
+        ]
+    )
+
+
+def _build_agent_model(endpoint: LlmEndpoint):
+    """Construct a provider-specific PydanticAI model or model id."""
+    if endpoint.provider in {"gateway", "openai-compatible"}:
+        from pydantic_ai.models.openai import OpenAIChatModel  # type: ignore
+        from pydantic_ai.providers.openai import OpenAIProvider  # type: ignore
+
+        provider = OpenAIProvider(
+            base_url=endpoint.base_url or None,
+            api_key=endpoint.api_key or None,
+        )
+        return OpenAIChatModel(endpoint.model_name, provider=provider)
+
+    if endpoint.provider == "openrouter":
+        from pydantic_ai.models.openrouter import OpenRouterModel  # type: ignore
+        from pydantic_ai.providers.openrouter import OpenRouterProvider  # type: ignore
+
+        provider = OpenRouterProvider(
+            api_key=endpoint.api_key or None,
+            app_url=endpoint.app_url or None,
+            app_title=endpoint.app_title or None,
+        )
+        return OpenRouterModel(endpoint.model_name, provider=provider)
+
+    if endpoint.provider == "openai" and (endpoint.base_url or endpoint.api_key):
+        from pydantic_ai.models.openai import OpenAIChatModel  # type: ignore
+        from pydantic_ai.providers.openai import OpenAIProvider  # type: ignore
+
+        provider = OpenAIProvider(
+            base_url=endpoint.base_url or None,
+            api_key=endpoint.api_key or None,
+        )
+        return OpenAIChatModel(endpoint.model_name, provider=provider)
+
+    return f"{endpoint.provider}:{endpoint.model_name}"
+
+
+def _result_output(result: Any, expected_type: Any) -> Any:
+    """Extract run output across pydantic-ai result API versions."""
+    output = getattr(result, "output", getattr(result, "data", None))
+    if output is None:
+        raise ModelContractError("model returned no output payload")
+    return output

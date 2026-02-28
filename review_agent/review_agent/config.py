@@ -16,6 +16,10 @@ class AgentSettings(BaseModel):
     """Configurable runtime knobs for review execution."""
 
     llm_model: str = "openai:gpt-4o"
+    llm_base_url: str = ""
+    llm_api_key: str = Field(default="", repr=False)
+    llm_app_url: str = ""
+    llm_app_title: str = ""
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
     max_symbols: int = Field(default=24, ge=1, le=100)
@@ -41,6 +45,10 @@ class AgentSettings(BaseModel):
         )
         return cls(
             llm_model=os.getenv("REVIEW_AGENT_LLM_MODEL", "openai:gpt-4o").strip(),
+            llm_base_url=os.getenv("REVIEW_AGENT_LLM_BASE_URL", "").strip(),
+            llm_api_key=os.getenv("REVIEW_AGENT_LLM_API_KEY", "").strip(),
+            llm_app_url=os.getenv("REVIEW_AGENT_LLM_APP_URL", "").strip(),
+            llm_app_title=os.getenv("REVIEW_AGENT_LLM_APP_TITLE", "").strip(),
             cxxtract_base_url=os.getenv("REVIEW_AGENT_CXXTRACT_BASE_URL", "http://127.0.0.1:8000").strip(),
             fail_on_severity=fail,
             max_symbols=int(os.getenv("REVIEW_AGENT_MAX_SYMBOLS", "24")),

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cxxtract-review-agent"
-version = "0.3.0"
+version = "0.3.1"
 description = "Standalone semantic C++ PR review agent powered by CXXtract2."
 requires-python = ">=3.11,<3.13"
 dependencies = [
