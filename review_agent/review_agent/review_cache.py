@@ -28,6 +28,7 @@ class ReviewTraceCache:
         head_sha: str,
         target_sha: str,
         merge_sha: str,
+        workspace_fingerprint: str,
         patch_text: str,
         policy: dict[str, Any],
     ) -> str:
@@ -37,6 +38,7 @@ class ReviewTraceCache:
             "head_sha": head_sha,
             "target_sha": target_sha,
             "merge_sha": merge_sha,
+            "workspace_fingerprint": workspace_fingerprint,
             "patch_hash": sha256(patch_text.encode("utf-8")).hexdigest(),
             "policy_hash": sha256(json.dumps(policy, sort_keys=True).encode("utf-8")).hexdigest(),
         }
@@ -60,7 +62,9 @@ class ReviewTraceCache:
 
     def save(self, key: str, payload: dict[str, Any]) -> None:
         p = self._path(key)
-        p.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp = p.with_suffix(f"{p.suffix}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(p)
 
     def _path(self, key: str) -> Path:
         return self._root / f"{key}.json"

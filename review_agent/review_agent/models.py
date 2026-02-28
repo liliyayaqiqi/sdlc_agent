@@ -10,12 +10,18 @@ from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
-# Version constant – bump on breaking prompt/parser/model changes
+# Version constants
 # ---------------------------------------------------------------------------
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.0"
 PROMPT_VERSION = "2026-02-28"
 PARSER_VERSION = "1"
+
+SUPPORTED_MODEL_PROVIDERS = {"openai", "fixture"}
+
+ReviewConfidence = Literal["high", "medium", "low"]
+FindingLocationSide = Literal["new", "old"]
+RepoRevisionRole = Literal["primary", "dependency", "auxiliary"]
 
 
 # ---------------------------------------------------------------------------
@@ -23,7 +29,7 @@ PARSER_VERSION = "1"
 # ---------------------------------------------------------------------------
 
 class InputNormalizationError(RuntimeError):
-    """Raised when diff/patch input cannot be normalized into ≥1 PatchChange."""
+    """Raised when diff/patch input cannot be normalized into >=1 PatchChange."""
 
 
 class InfrastructureError(RuntimeError):
@@ -32,6 +38,10 @@ class InfrastructureError(RuntimeError):
 
 class PublishingError(RuntimeError):
     """Raised when posting review results to a VCS host fails."""
+
+
+class ModelContractError(RuntimeError):
+    """Raised when planner/exploration/synthesis responses violate schema."""
 
 
 # ---------------------------------------------------------------------------
@@ -67,15 +77,7 @@ class FindingCategory(str, Enum):
 
 
 class ReviewExecutionStatus(str, Enum):
-    """Three-state execution outcome for CI gating.
-
-    * **pass** – review completed, no blocking findings.
-    * **block** – review completed, blocking findings present.
-    * **indeterminate** – review could not complete reliably
-      (timeout, backend failure, normalization failure, cache decode
-      failure, partial merge materialization, etc.).  CI policy should
-      decide whether indeterminate blocks or not.
-    """
+    """Three-state execution outcome for CI gating."""
 
     PASS = "pass"
     BLOCK = "block"
@@ -85,6 +87,18 @@ class ReviewExecutionStatus(str, Enum):
 # ---------------------------------------------------------------------------
 # Evidence and findings
 # ---------------------------------------------------------------------------
+
+class FindingLocation(BaseModel):
+    """Structured location for diff-aware publication."""
+
+    repo_id: str = ""
+    path: str
+    line: int = Field(default=0, ge=0)
+    side: FindingLocationSide = "new"
+    base_sha: str = ""
+    head_sha: str = ""
+    start_sha: str = ""
+
 
 class EvidenceRef(BaseModel):
     """Concrete evidence supporting a finding."""
@@ -112,9 +126,21 @@ class ReviewFinding(BaseModel):
     related_symbols: list[str] = Field(default_factory=list)
     related_repos: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
-    # Diff position for inline publishing (optional)
+    location: FindingLocation | None = None
+    # Deprecated compatibility fields.
     diff_path: str = ""
     diff_line: int = 0
+
+    @model_validator(mode="after")
+    def _sync_legacy_location_fields(self) -> "ReviewFinding":
+        if self.location is not None:
+            if not self.diff_path:
+                self.diff_path = self.location.path
+            if self.diff_line <= 0:
+                self.diff_line = self.location.line
+        elif self.diff_path and self.diff_line > 0:
+            self.location = FindingLocation(path=self.diff_path, line=self.diff_line)
+        return self
 
 
 class CoverageSummary(BaseModel):
@@ -139,7 +165,7 @@ class ToolCallRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Decision
+# Decision and publishing
 # ---------------------------------------------------------------------------
 
 class ReviewDecision(BaseModel):
@@ -150,6 +176,16 @@ class ReviewDecision(BaseModel):
     should_block: bool
     execution_status: ReviewExecutionStatus = ReviewExecutionStatus.PASS
     indeterminate_reason: str = ""
+    review_confidence: ReviewConfidence = "medium"
+
+
+class PublishResult(BaseModel):
+    """Structured publication outcome for VCS integrations."""
+
+    provider: str = ""
+    summary_posted: bool = False
+    inline_comments_posted: int = 0
+    warnings: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +333,7 @@ class SymbolFact(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Plans and views
+# Plans, exploration, synthesis, and views
 # ---------------------------------------------------------------------------
 
 class ReviewPlan(BaseModel):
@@ -309,6 +345,23 @@ class ReviewPlan(BaseModel):
     require_merge_preview: bool = False
     budget_split: dict[str, int] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
+
+
+class ExplorationResult(BaseModel):
+    """Typed result emitted by the exploration service."""
+
+    new_evidence: list[EvidenceRef] = Field(default_factory=list)
+    follow_up_symbols: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class SynthesisDraft(BaseModel):
+    """Model-owned synthesis output before policy gating."""
+
+    summary: str = ""
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    global_notes: list[str] = Field(default_factory=list)
 
 
 class ViewContextMaterialization(BaseModel):
@@ -364,6 +417,7 @@ class ReviewTestImpact(BaseModel):
 
 # Backward-compat alias (deprecated)
 TestImpact = ReviewTestImpact
+ReviewTestImpact.__test__ = False
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +433,21 @@ class RunMetadata(BaseModel):
     input_mode: str = ""  # "patch_file", "context_bundle", "gitlab_mr"
     run_id: str = ""
     backend_base_url: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Repo context
+# ---------------------------------------------------------------------------
+
+class RepoRevisionContext(BaseModel):
+    """Repo-specific revision inputs for merge-aware analysis."""
+
+    repo_id: str
+    base_sha: str = ""
+    head_sha: str = ""
+    target_sha: str = ""
+    merge_sha: str = ""
+    role: RepoRevisionRole = "dependency"
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +467,7 @@ class ReviewReport(BaseModel):
     fact_sheet: ReviewFactSheet | None = None
     test_impact: ReviewTestImpact | None = None
     run_metadata: RunMetadata | None = None
+    publish_result: PublishResult | None = None
     run_id: str = ""
 
 
@@ -418,6 +488,8 @@ class ReviewContextBundle(BaseModel):
     merge_preview_sha: str = ""
     primary_repo_id: str = ""
     per_repo_shas: dict[str, str] = Field(default_factory=dict)
+    repo_revisions: list[RepoRevisionContext] = Field(default_factory=list)
+    workspace_fingerprint: str = ""
     pr_metadata: dict[str, Any] = Field(default_factory=dict)
     policy: dict[str, Any] = Field(default_factory=dict)
 
@@ -442,6 +514,7 @@ class ReviewRequest(BaseModel):
     enable_cache: bool = True
     cache_dir: str = ".review_agent_cache"
     infra_fail_mode: str = "block"  # "block" or "pass"
+    workspace_fingerprint: str = ""
 
     @model_validator(mode="after")
     def _validate_request(self) -> "ReviewRequest":
@@ -450,4 +523,10 @@ class ReviewRequest(BaseModel):
         bundle_patch = (self.context_bundle.patch_text if self.context_bundle else "").strip()
         if not self.patch_text.strip() and not bundle_patch:
             raise ValueError("patch_text is empty and context_bundle.patch_text is empty")
+        model_name = (self.llm_model or "").strip() or "openai:gpt-4o"
+        provider = model_name.split(":", 1)[0]
+        if provider not in SUPPORTED_MODEL_PROVIDERS:
+            raise ValueError(
+                f"unsupported llm provider '{provider}'; supported providers: {sorted(SUPPORTED_MODEL_PROVIDERS)}"
+            )
         return self

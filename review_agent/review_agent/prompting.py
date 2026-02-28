@@ -86,7 +86,7 @@ The fact sheet may include suspicious_anchors flagging concurrency,
 lifetime, exception-flow, or ABI changes.  These should be investigated
 for hidden side-effects even when coverage is high.
 
-Return only data matching the ReviewReport schema.
+Return only data matching the SynthesisDraft schema.
 """
 
 EXPLORATION_SYSTEM_PROMPT = """\
@@ -111,7 +111,7 @@ or queries.
 1. Prioritize suspicious anchors and low-confidence symbols.
 2. Do NOT re-investigate symbols that already have good evidence.
 3. Respect your remaining call budget -- stop when exhausted.
-4. Return a structured summary of what you found.
+4. Return data matching the ExplorationResult schema.
 """
 
 
@@ -227,7 +227,7 @@ def build_synthesis_prompt(*, fact_sheet: ReviewFactSheet, fail_threshold: str) 
             "Check these for hidden side-effects even when coverage is high."
         )
 
-    sections.append("Output ReviewReport only.")
+    sections.append("Output SynthesisDraft only.")
     sections.append(json.dumps(payload, indent=2, ensure_ascii=True))
     return "\n\n".join(sections)
 

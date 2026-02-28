@@ -28,6 +28,7 @@ def render_markdown(report: ReviewReport) -> str:
         f"- Threshold: `{report.decision.fail_threshold.value}` (blocking findings: {report.decision.blocking_findings})"
     )
     lines.append(f"- Execution status: `{exec_status.value}`")
+    lines.append(f"- Review confidence: `{report.decision.review_confidence}`")
 
     if report.run_metadata:
         lines.append(f"- Agent version: `{report.run_metadata.agent_version}`")
@@ -54,7 +55,12 @@ def render_markdown(report: ReviewReport) -> str:
                 lines.append(f"- Symbols: `{', '.join(finding.related_symbols)}`")
             if finding.related_repos:
                 lines.append(f"- Repos: `{', '.join(finding.related_repos)}`")
-            if finding.diff_path and finding.diff_line > 0:
+            if finding.location is not None:
+                lines.append(
+                    f"- Location: `{finding.location.path}:{finding.location.line}`"
+                    f" ({finding.location.side})"
+                )
+            elif finding.diff_path and finding.diff_line > 0:
                 lines.append(f"- Location: `{finding.diff_path}:{finding.diff_line}`")
             if finding.evidence:
                 lines.append("- Evidence:")
@@ -126,6 +132,18 @@ def render_markdown(report: ReviewReport) -> str:
                 ln = edge.get("line", 0)
                 lines.append(f"- `{sym}` -> `{tf}` ({src}, line {ln})")
 
+        lines.append("")
+
+    if report.publish_result is not None:
+        lines.append("## Publish Result")
+        lines.append("")
+        lines.append(f"- Provider: `{report.publish_result.provider}`")
+        lines.append(f"- Summary posted: `{report.publish_result.summary_posted}`")
+        lines.append(f"- Inline comments posted: `{report.publish_result.inline_comments_posted}`")
+        if report.publish_result.warnings:
+            lines.append("- Publish warnings:")
+            for warn in report.publish_result.warnings[:20]:
+                lines.append(f"  - {warn}")
         lines.append("")
 
     lines.append("## Coverage")

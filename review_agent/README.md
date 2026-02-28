@@ -2,6 +2,10 @@
 
 Standalone, CI-first AI code review agent for C++ pull requests.
 
+Supported production provider in v1: `openai:*`
+
+Deterministic test provider: `fixture:*`
+
 ## What it does
 
 1. Accepts either a legacy patch input or a PR/MR context bundle.
@@ -26,7 +30,7 @@ Standalone, CI-first AI code review agent for C++ pull requests.
 6. Performs merge-aware review when baseline/head/merge-preview contexts
    are available.
 7. Runs semantic test impact analysis using call-edge traversal.
-8. Enforces budget knobs (max_symbols, max_tool_rounds,
+8. Enforces budget knobs (max_symbols, max_symbol_slots,
    max_total_tool_calls, etc.) across all stages.
 9. Produces:
    - `review_report.md`
@@ -37,7 +41,7 @@ Standalone, CI-first AI code review agent for C++ pull requests.
 
 ```powershell
 cd sdlc_agent/review_agent
-pip install -e .[dev]
+py -m pip install -e .[dev]
 review-agent run `
   --workspace-id ws_main `
   --patch-file F:/path/to/pr.patch `
@@ -54,6 +58,17 @@ review-agent run `
   --workspace-id ws_main `
   --context-file F:/path/to/review_context.json `
   --llm-model openai:gpt-4o `
+  --out-dir ./out
+```
+
+Patch-only reviews should provide a stable cache fingerprint if SHAs are not available:
+
+```powershell
+review-agent run `
+  --workspace-id ws_main `
+  --patch-file F:/path/to/pr.patch `
+  --workspace-fingerprint ws_main:2026-02-28:snapshot `
+  --llm-model fixture:default `
   --out-dir ./out
 ```
 

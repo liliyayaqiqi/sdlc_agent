@@ -1,210 +1,115 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
-from review_agent import cli
-from review_agent.models import (
-    CoverageSummary,
-    ReviewDecision,
-    ReviewExecutionStatus,
-    ReviewReport,
-    Severity,
-)
+from review_agent.testing.fakes import CxxtractFixtureServer, GitLabFixtureServer
 
 
-def _make_report(should_block: bool, *, exec_status: ReviewExecutionStatus = ReviewExecutionStatus.PASS) -> ReviewReport:
-    return ReviewReport(
-        workspace_id="ws_main",
-        summary="summary",
-        findings=[],
-        coverage=CoverageSummary(),
-        decision=ReviewDecision(
-            fail_threshold=Severity.HIGH,
-            blocking_findings=1 if should_block else 0,
-            should_block=should_block,
-            execution_status=exec_status,
-        ),
-        tool_usage=[],
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _run_cli(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    env["PYTHONPATH"] = str(ROOT)
+    return subprocess.run(
+        [sys.executable, "-m", "review_agent.cli", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
     )
 
 
-def test_cli_returns_pass_exit_code(monkeypatch, tmp_path: Path):
+def test_cli_patch_file_end_to_end(tmp_path: Path):
     patch_path = tmp_path / "pr.patch"
-    patch_path.write_text("diff --git a/a b/a\n", encoding="utf-8")
-
-    class _FakeOrchestrator:
-        def run(self, _request):
-            return _make_report(False)
-
-        @staticmethod
-        def write_report_files(report, out_dir):
-            out = Path(out_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            md = out / "review_report.md"
-            js = out / "review_report.json"
-            md.write_text("ok", encoding="utf-8")
-            js.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-            return md, js
-
-    monkeypatch.setattr(cli, "ReviewOrchestrator", _FakeOrchestrator)
-    code = cli.main(
-        [
-            "run",
-            "--workspace-id",
-            "ws_main",
-            "--patch-file",
-            str(patch_path),
-            "--out-dir",
-            str(tmp_path / "out"),
-        ]
-    )
-    assert code == 0
-
-
-def test_cli_returns_block_exit_code(monkeypatch, tmp_path: Path):
-    patch_path = tmp_path / "pr.patch"
-    patch_path.write_text("diff --git a/a b/a\n", encoding="utf-8")
-
-    class _FakeOrchestrator:
-        def run(self, _request):
-            return _make_report(True, exec_status=ReviewExecutionStatus.BLOCK)
-
-        @staticmethod
-        def write_report_files(report, out_dir):
-            out = Path(out_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            md = out / "review_report.md"
-            js = out / "review_report.json"
-            md.write_text("block", encoding="utf-8")
-            js.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-            return md, js
-
-    monkeypatch.setattr(cli, "ReviewOrchestrator", _FakeOrchestrator)
-    code = cli.main(
-        [
-            "run",
-            "--workspace-id",
-            "ws_main",
-            "--patch-file",
-            str(patch_path),
-            "--out-dir",
-            str(tmp_path / "out"),
-        ]
-    )
-    assert code == 2
-
-
-def test_cli_returns_indeterminate_exit_code(monkeypatch, tmp_path: Path):
-    """INDETERMINATE + should_block → exit code 3."""
-    patch_path = tmp_path / "pr.patch"
-    patch_path.write_text("diff --git a/a b/a\n", encoding="utf-8")
-
-    class _FakeOrchestrator:
-        def run(self, _request):
-            return _make_report(True, exec_status=ReviewExecutionStatus.INDETERMINATE)
-
-        @staticmethod
-        def write_report_files(report, out_dir):
-            out = Path(out_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            md = out / "review_report.md"
-            js = out / "review_report.json"
-            md.write_text("indet", encoding="utf-8")
-            js.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-            return md, js
-
-    monkeypatch.setattr(cli, "ReviewOrchestrator", _FakeOrchestrator)
-    code = cli.main(
-        [
-            "run",
-            "--workspace-id",
-            "ws_main",
-            "--patch-file",
-            str(patch_path),
-            "--out-dir",
-            str(tmp_path / "out"),
-        ]
-    )
-    assert code == 3
-
-
-def test_cli_indeterminate_pass_mode(monkeypatch, tmp_path: Path):
-    """INDETERMINATE + should_block=False → exit code 0."""
-    patch_path = tmp_path / "pr.patch"
-    patch_path.write_text("diff --git a/a b/a\n", encoding="utf-8")
-
-    class _FakeOrchestrator:
-        def run(self, _request):
-            return _make_report(False, exec_status=ReviewExecutionStatus.INDETERMINATE)
-
-        @staticmethod
-        def write_report_files(report, out_dir):
-            out = Path(out_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            md = out / "review_report.md"
-            js = out / "review_report.json"
-            md.write_text("indet-pass", encoding="utf-8")
-            js.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-            return md, js
-
-    monkeypatch.setattr(cli, "ReviewOrchestrator", _FakeOrchestrator)
-    code = cli.main(
-        [
-            "run",
-            "--workspace-id",
-            "ws_main",
-            "--patch-file",
-            str(patch_path),
-            "--out-dir",
-            str(tmp_path / "out"),
-            "--infra-fail-mode",
-            "pass",
-        ]
-    )
-    assert code == 0
-
-
-def test_cli_accepts_context_bundle(monkeypatch, tmp_path: Path):
-    context_path = tmp_path / "context.json"
-    context_path.write_text(
-        json.dumps(
-            {
-                "workspace_id": "ws_main",
-                "patch_text": "diff --git a/a b/a\n",
-                "base_sha": "a" * 40,
-                "head_sha": "b" * 40,
-                "target_branch_head_sha": "c" * 40,
-            }
+    patch_path.write_text(
+        "\n".join(
+            [
+                "diff --git a/src/app.cpp b/src/app.cpp",
+                "--- a/src/app.cpp",
+                "+++ b/src/app.cpp",
+                "@@ -1,2 +1,3 @@",
+                " int main() {",
+                "+  doLogin();",
+                " }",
+            ]
         ),
         encoding="utf-8",
     )
+    out_dir = tmp_path / "out"
 
-    class _FakeOrchestrator:
-        def run(self, request):
-            assert request.context_bundle is not None
-            return _make_report(False)
+    with CxxtractFixtureServer() as cxxtract:
+        result = _run_cli(
+            [
+                "run",
+                "--workspace-id",
+                "ws_main",
+                "--patch-file",
+                str(patch_path),
+                "--workspace-fingerprint",
+                "ws_main:test-snapshot",
+                "--llm-model",
+                "fixture:blocking",
+                "--cxxtract-base-url",
+                cxxtract.url,
+                "--out-dir",
+                str(out_dir),
+            ],
+            cwd=ROOT,
+        )
 
-        @staticmethod
-        def write_report_files(report, out_dir):
-            out = Path(out_dir)
-            out.mkdir(parents=True, exist_ok=True)
-            md = out / "review_report.md"
-            js = out / "review_report.json"
-            md.write_text("ok", encoding="utf-8")
-            js.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-            return md, js
+    assert result.returncode == 2, result.stderr
+    report = json.loads((out_dir / "review_report.json").read_text(encoding="utf-8"))
+    assert report["decision"]["execution_status"] == "block"
+    assert report["decision"]["review_confidence"] == "high"
+    assert report["findings"][0]["location"]["path"] == "src/app.cpp"
+    assert report["findings"][0]["location"]["line"] == 2
+    assert "publish_result" in report
+    assert report["publish_result"] is None
+    assert "confidence=high" in result.stdout
 
-    monkeypatch.setattr(cli, "ReviewOrchestrator", _FakeOrchestrator)
-    code = cli.main(
-        [
-            "run",
-            "--workspace-id",
-            "ws_main",
-            "--context-file",
-            str(context_path),
-            "--out-dir",
-            str(tmp_path / "out"),
-        ]
-    )
-    assert code == 0
+
+def test_cli_gitlab_publish_end_to_end(tmp_path: Path):
+    out_dir = tmp_path / "out"
+
+    with CxxtractFixtureServer() as cxxtract, GitLabFixtureServer() as gitlab:
+        result = _run_cli(
+            [
+                "run",
+                "--workspace-id",
+                "ws_main",
+                "--gitlab-url",
+                gitlab.url,
+                "--gitlab-token",
+                "token",
+                "--project-id",
+                "group%2Fproject",
+                "--mr-iid",
+                "7",
+                "--publish-inline-comments",
+                "--llm-model",
+                "fixture:gitlab-inline",
+                "--cxxtract-base-url",
+                cxxtract.url,
+                "--out-dir",
+                str(out_dir),
+            ],
+            cwd=ROOT,
+        )
+
+        assert len(gitlab.state.notes) == 1
+        assert len(gitlab.state.discussions) == 1
+
+    assert result.returncode == 2, result.stderr
+    report = json.loads((out_dir / "review_report.json").read_text(encoding="utf-8"))
+    assert report["run_metadata"]["input_mode"] == "gitlab_mr"
+    assert report["publish_result"]["provider"] == "gitlab"
+    assert report["publish_result"]["summary_posted"] is True
+    assert report["publish_result"]["inline_comments_posted"] == 1
+    assert report["findings"][0]["location"]["path"] == "src/app.cpp"

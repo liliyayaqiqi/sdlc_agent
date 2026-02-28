@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+from time import sleep
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 
 logger = logging.getLogger("review_agent.tool_clients.gitlab_client")
+
+_DEFAULT_RETRIES = 2
+_RETRY_BACKOFF_BASE = 0.5
 
 
 class GitLabApiError(RuntimeError):
@@ -134,7 +139,7 @@ class GitLabClient:
     def post_mr_note(self, *, project_id: str, mr_iid: int, body: str) -> dict[str, Any]:
         """Post a note (general comment) on an MR."""
         path = f"/api/v4/projects/{quote(str(project_id), safe='')}/merge_requests/{mr_iid}/notes"
-        return self._post(path, {"body": body})
+        return self._post(path, {"body": body}, retryable=True, idempotency_key=uuid4().hex)
 
     def post_mr_inline_discussion(
         self,
@@ -161,27 +166,69 @@ class GitLabClient:
             position["head_sha"] = head_sha
         if start_sha:
             position["start_sha"] = start_sha
-        return self._post(path, {"body": body, "position": position})
+        return self._post(
+            path,
+            {"body": body, "position": position},
+            retryable=True,
+            idempotency_key=uuid4().hex,
+        )
 
     # -- transport ---------------------------------------------------------
 
     def _get(self, path: str) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
         http = self._ensure_http()
-        try:
-            response = http.get(url)
-        except Exception as exc:
-            raise GitLabApiError(0, str(exc)) from exc
-        return self._decode(response)
+        last_exc: Exception | None = None
+        for attempt in range(1 + _DEFAULT_RETRIES):
+            try:
+                response = http.get(url)
+                return self._decode(response)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _DEFAULT_RETRIES and self._is_retryable_error(exc):
+                    delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("GET %s attempt %d failed (%s), retrying in %.1fs", path, attempt + 1, exc, delay)
+                    sleep(delay)
+                    continue
+                if isinstance(exc, GitLabApiError):
+                    raise
+                raise GitLabApiError(0, str(exc)) from exc
+        raise GitLabApiError(0, str(last_exc)) from last_exc  # pragma: no cover
 
-    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    def _post(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        retryable: bool = False,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
         url = f"{self._base_url}{path}"
         http = self._ensure_http()
-        try:
-            response = http.post(url, json=body)
-        except Exception as exc:
-            raise GitLabApiError(0, str(exc)) from exc
-        return self._decode(response)
+        retries = _DEFAULT_RETRIES if retryable else 0
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        last_exc: Exception | None = None
+        for attempt in range(1 + retries):
+            try:
+                response = http.post(url, json=body, headers=headers)
+                return self._decode(response)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries and self._is_retryable_error(exc):
+                    delay = _RETRY_BACKOFF_BASE * (2 ** attempt)
+                    logger.warning("POST %s attempt %d failed (%s), retrying in %.1fs", path, attempt + 1, exc, delay)
+                    sleep(delay)
+                    continue
+                if isinstance(exc, GitLabApiError):
+                    raise
+                raise GitLabApiError(0, str(exc)) from exc
+        raise GitLabApiError(0, str(last_exc)) from last_exc  # pragma: no cover
+
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        if isinstance(exc, GitLabApiError):
+            return exc.status_code >= 500
+        return isinstance(exc, (httpx.TransportError, httpx.TimeoutException))
 
     @staticmethod
     def _decode(response: httpx.Response) -> dict[str, Any]:

@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cxxtract-review-agent"
-version = "0.1.0"
+version = "0.3.0"
 description = "Standalone semantic C++ PR review agent powered by CXXtract2."
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "pydantic>=2.6.0",
     "pydantic-ai-slim[openai]>=1.63.0",
@@ -24,3 +24,6 @@ review-agent = "review_agent.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["review_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

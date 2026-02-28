@@ -2,50 +2,46 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from hashlib import sha1
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Any, Callable
-from time import perf_counter, sleep
+from time import perf_counter, sleep, time
 from uuid import uuid4
 
+from review_agent.adapters.llm import build_model_services
+from review_agent.application.pipeline import ReviewPipeline
 from review_agent.context_ingestion import IngestedReviewContext, ReviewContextIngestor
+from review_agent.domain.location_mapper import FindingLocationMapper
+from review_agent.domain.policy import finalize_report, indeterminate_report
 from review_agent.models import (
     AGENT_VERSION,
     CoverageSummary,
     EvidenceRef,
-    FindingCategory,
     InfrastructureError,
     InputNormalizationError,
+    ModelContractError,
     PARSER_VERSION,
     PROMPT_VERSION,
-    ReviewDecision,
+    RepoRevisionContext,
     ReviewExecutionStatus,
     ReviewFactSheet,
-    ReviewFinding,
     ReviewPlan,
     ReviewReport,
     ReviewRequest,
     ReviewTestImpact,
     RunMetadata,
-    SEVERITY_RANK,
     Severity,
     SymbolFact,
     SymbolImpact,
+    SynthesisDraft,
     ToolCallRecord,
     ViewContextMaterialization,
 )
 from review_agent.patch_parser import build_prepass_result, parse_unified_diff
-from review_agent.prompting import (
-    EXPLORATION_SYSTEM_PROMPT,
-    PLANNER_SYSTEM_PROMPT,
-    SYNTHESIS_SYSTEM_PROMPT,
-    build_exploration_prompt,
-    build_planner_prompt,
-    build_synthesis_prompt,
-)
 from review_agent.report_renderer import render_markdown
 from review_agent.review_cache import ReviewTraceCache
 from review_agent.tool_clients.cxxtract_http_client import CxxtractHttpClient
@@ -132,184 +128,17 @@ class ViewContexts:
 
 
 # ---------------------------------------------------------------------------
-# Agent factories
+# Service compatibility helpers
 # ---------------------------------------------------------------------------
 
 def build_planner_agent(model_name: str):
-    from pydantic_ai import Agent  # type: ignore
-
-    return Agent(model_name, system_prompt=PLANNER_SYSTEM_PROMPT, result_type=ReviewPlan)
+    planner, _, _ = build_model_services(model_name)
+    return planner
 
 
 def build_synthesis_agent(model_name: str):
-    from pydantic_ai import Agent  # type: ignore
-
-    return Agent(model_name, system_prompt=SYNTHESIS_SYSTEM_PROMPT, result_type=ReviewReport)
-
-
-def build_exploration_agent(
-    model_name: str,
-    *,
-    client: CxxtractHttpClient,
-    budget: BudgetTracker,
-    tool_usage: list[ToolCallRecord],
-    analysis_context: dict[str, Any],
-):
-    """Build a PydanticAI agent with the 6 explore tools registered."""
-    from pydantic_ai import Agent, RunContext  # type: ignore
-
-    @dataclass
-    class ExploreDeps:
-        client: CxxtractHttpClient
-        budget: BudgetTracker
-        tool_usage: list[ToolCallRecord]
-        analysis_context: dict[str, Any]
-
-    agent = Agent(
-        model_name,
-        system_prompt=EXPLORATION_SYSTEM_PROMPT,
-        deps_type=ExploreDeps,
-        result_type=str,
-    )
-
-    def _record(deps: ExploreDeps, tool_name: str, success: bool, elapsed_ms: float, note: str = ""):
-        deps.tool_usage.append(
-            ToolCallRecord(skill="explorer", tool=tool_name, success=success, elapsed_ms=elapsed_ms, note=note)
-        )
-
-    @agent.tool  # type: ignore[misc]
-    def explore_list_candidates(ctx: RunContext[ExploreDeps], symbol: str, max_files: int = 50) -> dict[str, Any]:
-        """Find candidate files that may contain a symbol."""
-        deps = ctx.deps
-        if not deps.budget.consume_call():
-            return {"warning": "budget_exhausted", "candidates": []}
-        t0 = perf_counter()
-        try:
-            capped = min(max_files, deps.budget.max_candidates_per_symbol)
-            result = deps.client.explore_list_candidates(
-                symbol=symbol, max_files=capped, include_rg=True,
-                analysis_context=deps.analysis_context,
-            )
-            _record(deps, "explore.list_candidates", True, (perf_counter() - t0) * 1000)
-            return result
-        except Exception as exc:
-            _record(deps, "explore.list_candidates", False, (perf_counter() - t0) * 1000, str(exc))
-            return {"warning": str(exc), "candidates": []}
-
-    @agent.tool  # type: ignore[misc]
-    def explore_fetch_symbols(ctx: RunContext[ExploreDeps], symbol: str, candidate_file_keys: list[str] | None = None) -> dict[str, Any]:
-        """Look up symbol definitions across candidate files."""
-        deps = ctx.deps
-        if not deps.budget.consume_call():
-            return {"warning": "budget_exhausted", "symbols": []}
-        t0 = perf_counter()
-        try:
-            result = deps.client.explore_fetch_symbols(
-                symbol=symbol,
-                candidate_file_keys=candidate_file_keys or [],
-                excluded_file_keys=[],
-                limit=deps.budget.max_fetch_limit,
-                analysis_context=deps.analysis_context,
-            )
-            _record(deps, "explore.fetch_symbols", True, (perf_counter() - t0) * 1000)
-            return result
-        except Exception as exc:
-            _record(deps, "explore.fetch_symbols", False, (perf_counter() - t0) * 1000, str(exc))
-            return {"warning": str(exc), "symbols": []}
-
-    @agent.tool  # type: ignore[misc]
-    def explore_fetch_references(ctx: RunContext[ExploreDeps], symbol: str, candidate_file_keys: list[str] | None = None) -> dict[str, Any]:
-        """Trace references to a symbol across candidate files."""
-        deps = ctx.deps
-        if not deps.budget.consume_call():
-            return {"warning": "budget_exhausted", "references": []}
-        t0 = perf_counter()
-        try:
-            result = deps.client.explore_fetch_references(
-                symbol=symbol,
-                candidate_file_keys=candidate_file_keys or [],
-                excluded_file_keys=[],
-                limit=deps.budget.max_fetch_limit,
-                analysis_context=deps.analysis_context,
-            )
-            _record(deps, "explore.fetch_references", True, (perf_counter() - t0) * 1000)
-            return result
-        except Exception as exc:
-            _record(deps, "explore.fetch_references", False, (perf_counter() - t0) * 1000, str(exc))
-            return {"warning": str(exc), "references": []}
-
-    @agent.tool  # type: ignore[misc]
-    def explore_fetch_call_edges(ctx: RunContext[ExploreDeps], symbol: str, direction: str = "both", candidate_file_keys: list[str] | None = None) -> dict[str, Any]:
-        """Trace callers and callees of a symbol."""
-        deps = ctx.deps
-        if not deps.budget.consume_call():
-            return {"warning": "budget_exhausted", "edges": []}
-        t0 = perf_counter()
-        try:
-            result = deps.client.explore_fetch_call_edges(
-                symbol=symbol,
-                direction=direction,
-                candidate_file_keys=candidate_file_keys or [],
-                excluded_file_keys=[],
-                limit=deps.budget.max_fetch_limit,
-                analysis_context=deps.analysis_context,
-            )
-            _record(deps, "explore.fetch_call_edges", True, (perf_counter() - t0) * 1000)
-            return result
-        except Exception as exc:
-            _record(deps, "explore.fetch_call_edges", False, (perf_counter() - t0) * 1000, str(exc))
-            return {"warning": str(exc), "edges": []}
-
-    @agent.tool  # type: ignore[misc]
-    def explore_read_file(ctx: RunContext[ExploreDeps], file_key: str, start_line: int = 1, end_line: int = 120) -> dict[str, Any]:
-        """Read source code from a file."""
-        deps = ctx.deps
-        if not deps.budget.consume_call():
-            return {"warning": "budget_exhausted", "content": ""}
-        t0 = perf_counter()
-        try:
-            result = deps.client.explore_read_file(
-                file_key=file_key,
-                start_line=start_line,
-                end_line=end_line,
-                max_bytes=32_000,
-            )
-            _record(deps, "explore.read_file", True, (perf_counter() - t0) * 1000)
-            return result
-        except Exception as exc:
-            _record(deps, "explore.read_file", False, (perf_counter() - t0) * 1000, str(exc))
-            return {"warning": str(exc), "content": ""}
-
-    @agent.tool  # type: ignore[misc]
-    def explore_rg_search(ctx: RunContext[ExploreDeps], query: str, mode: str = "symbol", max_hits: int = 50) -> dict[str, Any]:
-        """Search for text/symbols across the workspace."""
-        deps = ctx.deps
-        if not deps.budget.consume_call():
-            return {"warning": "budget_exhausted", "hits": []}
-        t0 = perf_counter()
-        try:
-            result = deps.client.explore_rg_search(
-                query=query,
-                mode=mode,
-                max_hits=min(max_hits, 200),
-                max_files=min(50, deps.budget.max_candidates_per_symbol),
-                timeout_s=min(deps.budget.parse_timeout_s, 30),
-                context_lines=1,
-                analysis_context=deps.analysis_context,
-            )
-            _record(deps, "explore.rg_search", True, (perf_counter() - t0) * 1000)
-            return result
-        except Exception as exc:
-            _record(deps, "explore.rg_search", False, (perf_counter() - t0) * 1000, str(exc))
-            return {"warning": str(exc), "hits": []}
-
-    deps = ExploreDeps(
-        client=client,
-        budget=budget,
-        tool_usage=tool_usage,
-        analysis_context=analysis_context,
-    )
-    return agent, deps
+    _, _, synthesis = build_model_services(model_name)
+    return synthesis
 
 
 # ---------------------------------------------------------------------------
@@ -321,16 +150,17 @@ class ReviewOrchestrator:
         self,
         *,
         client: CxxtractHttpClient | None = None,
-        planner_factory: Callable[[str], Any] | None = None,
-        synthesis_factory: Callable[[str], Any] | None = None,
+        service_factory: Callable[[str], tuple[Any, Any, Any]] | None = None,
     ) -> None:
         self._client = client
-        self._planner_factory = planner_factory or build_planner_agent
-        self._synthesis_factory = synthesis_factory or build_synthesis_agent
-        self._planner_cache: dict[str, Any] = {}
-        self._synthesis_cache: dict[str, Any] = {}
+        self._service_factory = service_factory or build_model_services
+        self._service_cache: dict[str, tuple[Any, Any, Any]] = {}
+        self._pipeline = ReviewPipeline(orchestrator=self)
 
     def run(self, request: ReviewRequest) -> ReviewReport:
+        return self._pipeline.run(request)
+
+    def _run_request(self, request: ReviewRequest) -> ReviewReport:
         run_id = uuid4().hex[:12]
         owns_client = self._client is None
         client = self._client or CxxtractHttpClient(
@@ -374,7 +204,7 @@ class ReviewOrchestrator:
                 reason=f"input_normalization_error:{exc}",
                 summary=f"Input normalization failed: {exc}",
                 fail_threshold=request.fail_on_severity,
-                should_block=infra_should_block,
+                should_block=True,
                 run_id=run_id,
                 run_metadata=RunMetadata(
                     input_mode="unknown",
@@ -478,6 +308,7 @@ class ReviewOrchestrator:
                 head_sha=bundle.head_sha,
                 target_sha=bundle.target_branch_head_sha,
                 merge_sha=bundle.merge_preview_sha,
+                workspace_fingerprint=bundle.workspace_fingerprint,
                 patch_text=bundle.patch_text,
                 policy={
                     "fail_on_severity": runtime.fail_on_severity.value,
@@ -506,7 +337,7 @@ class ReviewOrchestrator:
         # --- View materialization (only on cache miss) ---
         views = self._prepare_views(
             client=client, runtime_context=bundle,
-            lock_root=runtime.cache_dir, created_context_ids=created_context_ids,
+            lock_root=runtime.cache_dir, created_context_ids=created_context_ids, run_id=run_id,
         )
         tool_usage: list[ToolCallRecord] = []
 
@@ -522,22 +353,21 @@ class ReviewOrchestrator:
 
         # --- Step 1: LLM Planner ---
         _check_deadline(deadline, "planner")
-        planner = self._planner_for(request.llm_model)
-        planner_prompt = build_planner_prompt(
-            context=bundle,
-            prepass=prepass,
-            budgets={
-                "max_symbols": runtime.max_symbols,
-                "max_symbol_slots": runtime.max_symbol_slots,
-                "max_total_tool_calls": runtime.max_total_tool_calls,
-                "parse_timeout_s": runtime.parse_timeout_s,
-                "parse_workers": runtime.parse_workers,
-                "max_candidates_per_symbol": runtime.max_candidates_per_symbol,
-                "max_fetch_limit": runtime.max_fetch_limit,
-            },
-        )
+        planner, exploration, synthesis = self._services_for(request.llm_model)
         try:
-            plan = planner.run_sync(planner_prompt).data
+            plan = planner.plan(
+                context=bundle,
+                prepass=prepass,
+                budgets={
+                    "max_symbols": runtime.max_symbols,
+                    "max_symbol_slots": runtime.max_symbol_slots,
+                    "max_total_tool_calls": runtime.max_total_tool_calls,
+                    "parse_timeout_s": runtime.parse_timeout_s,
+                    "parse_workers": runtime.parse_workers,
+                    "max_candidates_per_symbol": runtime.max_candidates_per_symbol,
+                    "max_fetch_limit": runtime.max_fetch_limit,
+                },
+            )
         except Exception as exc:
             logger.warning("[%s] planner failed, using seed-symbol fallback: %s", run_id, exc)
             plan = ReviewPlan(prioritized_symbols=[s.symbol for s in prepass.seed_symbols[: runtime.max_symbols]])
@@ -576,22 +406,37 @@ class ReviewOrchestrator:
         # --- Step 5: Agent-driven follow-up exploration ---
         _check_deadline(deadline, "exploration")
         if budget.remaining_calls > 0 and budget.remaining_slots > 0:
-            followup_evidence = self._agent_follow_up(
-                model_name=request.llm_model,
-                client=client,
-                budget=budget,
-                tool_usage=tool_usage,
-                fact_sheet=fact_sheet,
-                prepass=prepass,
-                views=views,
-            )
-            # Merge follow-up evidence anchors into fact sheet
-            if followup_evidence:
+            try:
+                followup = exploration.explore(
+                    fact_sheet=fact_sheet,
+                    prepass=prepass,
+                    remaining_calls=budget.remaining_calls,
+                    remaining_rounds=budget.remaining_slots,
+                    client=client,
+                    budget=budget,
+                    tool_usage=tool_usage,
+                    analysis_context=views.head,
+                )
+            except Exception as exc:
+                logger.warning("[%s] exploration follow-up failed: %s", run_id, exc)
+                followup = None
+            if followup is not None:
                 existing_anchors = list(fact_sheet.evidence_anchors)
-                existing_anchors.extend(followup_evidence[:100])
+                existing_anchors.extend(followup.new_evidence[:100])
+                warnings = list(fact_sheet.warnings)
+                warnings.extend(followup.warnings)
+                if followup.summary.strip():
+                    existing_anchors.append(
+                        EvidenceRef(
+                            tool="agent.exploration_followup",
+                            description="agent_exploration_summary",
+                            snippet=followup.summary[:500],
+                        )
+                    )
+                    warnings.append("agent_followup_executed")
                 fact_sheet = fact_sheet.model_copy(update={
                     "evidence_anchors": existing_anchors[:500],
-                    "warnings": sorted(set(fact_sheet.warnings + ["agent_followup_executed"])),
+                    "warnings": sorted(set(warnings)),
                 })
 
         # --- Step 6: Test impact analysis ---
@@ -603,31 +448,49 @@ class ReviewOrchestrator:
 
         # --- Step 7: LLM Synthesis ---
         _check_deadline(deadline, "synthesis")
-        synth = self._synthesis_for(request.llm_model)
         try:
-            draft = synth.run_sync(
-                build_synthesis_prompt(fact_sheet=fact_sheet, fail_threshold=runtime.fail_on_severity.value)
-            ).data
-        except Exception as exc:
-            logger.warning("[%s] synthesis failed, using deterministic fallback: %s", run_id, exc)
-            draft = ReviewReport(
-                workspace_id=bundle.workspace_id,
-                summary="LLM synthesis failed; using deterministic fallback.",
-                findings=[],
-                coverage=coverage,
-                decision=ReviewDecision(
-                    fail_threshold=runtime.fail_on_severity,
-                    blocking_findings=0,
-                    should_block=False,
-                    execution_status=ReviewExecutionStatus.INDETERMINATE,
-                    indeterminate_reason="synthesis_failed",
-                ),
-                tool_usage=tool_usage,
+            draft = synthesis.synthesize(
+                fact_sheet=fact_sheet,
+                fail_threshold=runtime.fail_on_severity.value,
             )
+        except ModelContractError as exc:
+            logger.error("[%s] synthesis contract failed: %s", run_id, exc)
+            return _indeterminate_report(
+                workspace_id=bundle.workspace_id,
+                reason=f"synthesis_contract_error:{exc}",
+                summary=f"Synthesis contract failed: {exc}",
+                fail_threshold=runtime.fail_on_severity,
+                should_block=True,
+                run_id=run_id,
+                run_metadata=run_metadata,
+            ).model_copy(update={
+                "fact_sheet": fact_sheet,
+                "test_impact": test_impact,
+                "tool_usage": tool_usage,
+                "coverage": fact_sheet.coverage,
+            })
+        except Exception as exc:
+            logger.error("[%s] synthesis failed: %s", run_id, exc)
+            return _indeterminate_report(
+                workspace_id=bundle.workspace_id,
+                reason=f"synthesis_failed:{exc}",
+                summary=f"Synthesis failed: {exc}",
+                fail_threshold=runtime.fail_on_severity,
+                should_block=True,
+                run_id=run_id,
+                run_metadata=run_metadata,
+            ).model_copy(update={
+                "fact_sheet": fact_sheet,
+                "test_impact": test_impact,
+                "tool_usage": tool_usage,
+                "coverage": fact_sheet.coverage,
+            })
 
         # --- Step 8: Policy gate ---
-        final = _policy_gate(
-            report=draft,
+        location_mapper = FindingLocationMapper(changes=changes, bundle=bundle)
+        draft = draft.model_copy(update={"findings": [location_mapper.apply(finding) for finding in draft.findings]})
+        final = finalize_report(
+            draft=draft,
             fact_sheet=fact_sheet,
             test_impact=test_impact,
             fail_threshold=runtime.fail_on_severity,
@@ -635,7 +498,6 @@ class ReviewOrchestrator:
             workspace_id=bundle.workspace_id,
             run_id=run_id,
             run_metadata=run_metadata,
-            infra_fail_mode=request.infra_fail_mode,
         )
         if cache is not None and cache_key:
             try:
@@ -644,17 +506,11 @@ class ReviewOrchestrator:
                 logger.warning("[%s] failed to persist cache: %s", run_id, exc)
         return final
 
-    def _planner_for(self, model_name: str):
+    def _services_for(self, model_name: str) -> tuple[Any, Any, Any]:
         key = (model_name or "").strip() or "openai:gpt-4o"
-        if key not in self._planner_cache:
-            self._planner_cache[key] = self._planner_factory(key)
-        return self._planner_cache[key]
-
-    def _synthesis_for(self, model_name: str):
-        key = (model_name or "").strip() or "openai:gpt-4o"
-        if key not in self._synthesis_cache:
-            self._synthesis_cache[key] = self._synthesis_factory(key)
-        return self._synthesis_cache[key]
+        if key not in self._service_cache:
+            self._service_cache[key] = self._service_factory(key)
+        return self._service_cache[key]
 
     def _prepare_views(
         self,
@@ -663,21 +519,38 @@ class ReviewOrchestrator:
         runtime_context,
         lock_root: str,
         created_context_ids: list[str],
+        run_id: str,
     ) -> ViewContexts:
         ws_id = runtime_context.workspace_id
         baseline_id = f"{ws_id}:baseline"
         pr_id = str(runtime_context.pr_metadata.get("pr_id", "") or runtime_context.pr_metadata.get("mr_id", "") or "review")
-        head_id = f"{ws_id}:pr:{pr_id}:head"
-        merge_id = f"{ws_id}:pr:{pr_id}:merge"
+        head_id = f"{ws_id}:pr:{pr_id}:head:{run_id}"
+        merge_id = f"{ws_id}:pr:{pr_id}:merge:{run_id}"
         warnings: list[str] = []
 
         baseline_materialized = False
         head_materialized = False
         merge_materialized = False
+        repo_revisions: list[RepoRevisionContext] = list(runtime_context.repo_revisions or [])
 
         try:
-            with _workspace_lock(lock_root=lock_root, workspace_id=ws_id, timeout_s=20.0):
-                if runtime_context.primary_repo_id and _is_sha(runtime_context.target_branch_head_sha):
+            with _workspace_lock(lock_root=lock_root, workspace_id=ws_id, timeout_s=20.0, run_id=run_id):
+                revisions_to_sync = [row for row in repo_revisions if _is_sha(row.target_sha)]
+                if revisions_to_sync:
+                    baseline_materialized = True
+                    for row in revisions_to_sync:
+                        try:
+                            client.sync_repo(
+                                repo_id=row.repo_id,
+                                commit_sha=row.target_sha,
+                                branch=str(runtime_context.pr_metadata.get("target_branch", "")),
+                                force_clean=True,
+                            )
+                        except Exception as exc:
+                            logger.warning("baseline sync failed for %s: %s", row.repo_id, exc)
+                            baseline_materialized = False
+                            warnings.append(f"baseline_sync_failed:{row.repo_id}:{exc}")
+                elif runtime_context.primary_repo_id and _is_sha(runtime_context.target_branch_head_sha):
                     try:
                         client.sync_repo(
                             repo_id=runtime_context.primary_repo_id,
@@ -773,12 +646,17 @@ class ReviewOrchestrator:
             _check_deadline(deadline, f"evidence_collection_symbol_{idx}")
             impact = _collect_symbol(client, runtime, views.head, symbol, tool_usage, budget)
             impacts.append(impact)
-            if budget.exhausted:
-                break
-            base_refs, base_edges = _fetch_counts(client, runtime, views.baseline, symbol, impact, tool_usage, budget)
+            warnings = list(impact.warnings)
+            if views.status.baseline_materialized and not budget.exhausted:
+                base_refs, base_edges = _fetch_counts(client, runtime, views.baseline, symbol, impact, tool_usage, budget)
+            else:
+                base_refs, base_edges = (0, 0)
+                warnings.append("baseline_counts_skipped")
             merge_refs, merge_edges = (0, 0)
-            if views.merge_preview is not None and not budget.exhausted:
+            if views.merge_preview is not None and views.status.merge_preview_materialized and not budget.exhausted:
                 merge_refs, merge_edges = _fetch_counts(client, runtime, views.merge_preview, symbol, impact, tool_usage, budget)
+            elif views.merge_preview is not None:
+                warnings.append("merge_counts_skipped")
             facts.append(
                 SymbolFact(
                     symbol=symbol,
@@ -792,58 +670,10 @@ class ReviewOrchestrator:
                     merge_preview_call_edge_count=merge_edges,
                     reference_delta_vs_baseline=len(impact.references) - base_refs,
                     call_edge_delta_vs_baseline=len(impact.call_edges) - base_edges,
-                    warnings=impact.warnings,
+                    warnings=sorted(set(warnings)),
                 )
             )
         return impacts, facts, _coverage(impacts)
-
-    def _agent_follow_up(
-        self,
-        *,
-        model_name: str,
-        client: CxxtractHttpClient,
-        budget: BudgetTracker,
-        tool_usage: list[ToolCallRecord],
-        fact_sheet: ReviewFactSheet,
-        prepass,
-        views: ViewContexts,
-    ) -> list[EvidenceRef]:
-        """Run agent-driven follow-up exploration with remaining budget."""
-        if budget.remaining_calls < 2 or budget.remaining_slots < 1:
-            return []
-
-        prompt = build_exploration_prompt(
-            fact_sheet=fact_sheet,
-            prepass=prepass,
-            remaining_calls=budget.remaining_calls,
-            remaining_rounds=budget.remaining_slots,
-        )
-
-        try:
-            agent, deps = build_exploration_agent(
-                model_name,
-                client=client,
-                budget=budget,
-                tool_usage=tool_usage,
-                analysis_context=views.head,
-            )
-            result = agent.run_sync(prompt, deps=deps)
-            summary_text = str(result.data or "")
-        except Exception as exc:
-            logger.warning("exploration follow-up failed: %s", exc)
-            return []
-
-        # Convert the exploration summary to evidence anchors
-        evidence: list[EvidenceRef] = []
-        if summary_text.strip():
-            evidence.append(
-                EvidenceRef(
-                    tool="agent.exploration_followup",
-                    description="agent_exploration_summary",
-                    snippet=summary_text[:500],
-                )
-            )
-        return evidence
 
     @staticmethod
     def write_report_files(report: ReviewReport, out_dir: str | Path) -> tuple[Path, Path]:
@@ -1205,7 +1035,7 @@ def _is_merge_degraded(bundle, views: ViewContexts) -> bool:
         return False  # no merge requested, not degraded
     if not views.status.merge_preview_materialized:
         return True
-    if not bundle.primary_repo_id and not bundle.per_repo_shas:
+    if not bundle.repo_revisions and not bundle.primary_repo_id and not bundle.per_repo_shas:
         return True
     return False
 
@@ -1327,82 +1157,17 @@ def _policy_gate(
     run_metadata: RunMetadata | None = None,
     infra_fail_mode: str = "block",
 ) -> ReviewReport:
-    findings: list[ReviewFinding] = []
-    for finding in report.findings:
-        if finding.severity in {Severity.HIGH, Severity.CRITICAL} and not finding.evidence:
-            finding = finding.model_copy(update={"severity": Severity.MEDIUM, "tags": sorted(set(finding.tags + ["auto_downgraded_missing_evidence"]))})
-        findings.append(finding)
-    low_cov = fact_sheet.coverage.verified_ratio < 0.4
-    if low_cov:
-        findings.append(
-            ReviewFinding(
-                id=_fid("cov", str(fact_sheet.coverage.verified_ratio)),
-                severity=Severity.MEDIUM,
-                category=FindingCategory.CONFIDENCE_GAP,
-                title="Low semantic coverage reduces confidence",
-                impact="Coverage is partial; strict blocking can be overconfident.",
-                recommendation="Increase parse/tool budget and rerun review.",
-                evidence=[EvidenceRef(tool="policy_gate", description=f"verified_ratio={fact_sheet.coverage.verified_ratio:.3f}")],
-                confidence=0.95,
-                tags=["coverage_policy"],
-            )
-        )
-
-    # Add merge degradation finding if applicable
-    if fact_sheet.merge_analysis_degraded:
-        findings.append(
-            ReviewFinding(
-                id=_fid("merge_degraded", workspace_id),
-                severity=Severity.MEDIUM,
-                category=FindingCategory.CONFIDENCE_GAP,
-                title="Merge-aware analysis is degraded",
-                impact="Merge-preview comparison may be unreliable; merge-specific findings disabled.",
-                recommendation="Provide primary_repo_id and per_repo_shas for accurate merge analysis.",
-                evidence=[EvidenceRef(tool="policy_gate", description="merge_analysis_degraded")],
-                confidence=0.95,
-                tags=["merge_degraded"],
-            )
-        )
-
-    findings = sorted(findings, key=lambda f: (-SEVERITY_RANK[f.severity], f.title, f.id))
-    blocking = len([f for f in findings if SEVERITY_RANK[f.severity] >= SEVERITY_RANK[fail_threshold]])
-
-    # Determine execution status
-    exec_status = ReviewExecutionStatus.PASS
-    indet_reason = ""
-    if low_cov and not any(f.severity == Severity.CRITICAL and f.evidence for f in findings):
-        exec_status = ReviewExecutionStatus.INDETERMINATE
-        indet_reason = "low_coverage_no_evidenced_critical"
-        # With indeterminate, blocking depends on infra_fail_mode
-        should_block = blocking > 0 and infra_fail_mode != "pass"
-    elif blocking > 0:
-        exec_status = ReviewExecutionStatus.BLOCK
-        should_block = True
-    else:
-        should_block = False
-
-    summary = report.summary.strip() or f"Reviewed {len(fact_sheet.changed_files)} files; findings={len(findings)}."
-
-    decision = ReviewDecision(
+    draft = SynthesisDraft(summary=report.summary, findings=report.findings)
+    return finalize_report(
+        draft=draft,
+        fact_sheet=fact_sheet,
+        test_impact=test_impact,
         fail_threshold=fail_threshold,
-        blocking_findings=blocking,
-        should_block=should_block,
-        execution_status=exec_status,
-        indeterminate_reason=indet_reason,
+        tool_usage=tool_usage,
+        workspace_id=workspace_id,
+        run_id=run_id,
+        run_metadata=run_metadata,
     )
-
-    return report.model_copy(update={
-        "workspace_id": workspace_id,
-        "summary": summary,
-        "findings": findings,
-        "coverage": fact_sheet.coverage,
-        "decision": decision,
-        "tool_usage": tool_usage,
-        "fact_sheet": fact_sheet,
-        "test_impact": test_impact,
-        "run_metadata": run_metadata,
-        "run_id": run_id,
-    })
 
 
 # ---------------------------------------------------------------------------
@@ -1420,19 +1185,12 @@ def _indeterminate_report(
     run_metadata: RunMetadata | None = None,
 ) -> ReviewReport:
     """Build a report with INDETERMINATE execution status."""
-    return ReviewReport(
+    return indeterminate_report(
         workspace_id=workspace_id,
+        reason=reason,
         summary=summary,
-        findings=[],
-        coverage=CoverageSummary(),
-        decision=ReviewDecision(
-            fail_threshold=fail_threshold,
-            blocking_findings=0,
-            should_block=should_block,
-            execution_status=ReviewExecutionStatus.INDETERMINATE,
-            indeterminate_reason=reason,
-        ),
-        tool_usage=[],
+        fail_threshold=fail_threshold,
+        should_block=should_block,
         run_id=run_id,
         run_metadata=run_metadata,
     )
@@ -1472,47 +1230,28 @@ def _looks_like_test_path(path: str) -> bool:
     )
 
 
-def _pid_alive(pid: int) -> bool:
-    """Check whether *pid* refers to a running process."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Process exists but we lack permission to signal it
-        return True
-    except OSError:
-        return False
-
-
 class _workspace_lock:
-    """Best-effort cross-process lock to avoid concurrent sync/context collisions.
+    """Best-effort cross-process lock with TTL-based stale cleanup."""
 
-    Includes stale-lock detection: if the lock file exists and contains a PID
-    that is no longer alive, the lock is removed and re-acquired.
-    """
-
-    def __init__(self, *, lock_root: str, workspace_id: str, timeout_s: float) -> None:
+    def __init__(self, *, lock_root: str, workspace_id: str, timeout_s: float, run_id: str) -> None:
         self._lock_root = Path(lock_root).resolve() / ".workspace_locks"
         self._workspace_id = workspace_id
         self._timeout_s = max(1.0, timeout_s)
+        self._run_id = run_id
         safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in workspace_id)
         self._lock_path = self._lock_root / f"{safe_id}.lock"
         self._fd = -1
 
     def _try_remove_stale(self) -> bool:
-        """If the lock file is stale (owner PID dead), remove it."""
+        """If the lock file TTL has expired, remove it."""
         try:
-            raw = self._lock_path.read_text(encoding="utf-8").strip()
-            pid = int(raw)
+            raw = json.loads(self._lock_path.read_text(encoding="utf-8"))
         except Exception:
+            raw = {}
+        expires_at = float(raw.get("expires_at", 0.0) or 0.0)
+        if expires_at and expires_at > time():
             return False
-        if _pid_alive(pid):
-            return False
-        logger.info("removing stale lock for workspace %s (dead pid %d)", self._workspace_id, pid)
+        logger.info("removing stale lock for workspace %s", self._workspace_id)
         try:
             self._lock_path.unlink(missing_ok=True)
         except Exception:
@@ -1522,11 +1261,17 @@ class _workspace_lock:
     def __enter__(self):
         self._lock_root.mkdir(parents=True, exist_ok=True)
         deadline = perf_counter() + self._timeout_s
+        payload = {
+            "workspace_id": self._workspace_id,
+            "run_id": self._run_id,
+            "created_at": time(),
+            "expires_at": time() + self._timeout_s,
+        }
         stale_checked = False
         while True:
             try:
                 self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self._fd, str(os.getpid()).encode("utf-8"))
+                os.write(self._fd, json.dumps(payload, ensure_ascii=True).encode("utf-8"))
                 return self
             except FileExistsError:
                 if not stale_checked:

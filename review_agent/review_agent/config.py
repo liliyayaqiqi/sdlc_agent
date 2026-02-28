@@ -35,7 +35,6 @@ class AgentSettings(BaseModel):
         """Load settings from REVIEW_AGENT_* environment variables."""
         fail_raw = os.getenv("REVIEW_AGENT_FAIL_ON_SEVERITY", "high").strip().lower()
         fail = Severity(fail_raw) if fail_raw in {s.value for s in Severity} else Severity.HIGH
-        # Support both new name and deprecated alias
         max_symbol_slots = int(
             os.getenv("REVIEW_AGENT_MAX_SYMBOL_SLOTS", "")
             or os.getenv("REVIEW_AGENT_MAX_TOOL_ROUNDS", "30")
