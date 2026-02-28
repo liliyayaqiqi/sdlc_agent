@@ -7,6 +7,7 @@ from review_agent.manifest_resolver import (
     dependency_map,
     load_workspace_manifest,
     repo_for_file_key,
+    resolve_repo_id_for_project_path,
     resolve_file_key,
 )
 
@@ -76,3 +77,18 @@ def test_resolve_file_key_from_repo_relative_path(tmp_path: Path):
     )
     assert fk == "repoA:src/a.cpp"
 
+
+def test_resolve_repo_id_for_gitlab_project_path():
+    mf = WorkspaceManifest.model_validate(
+        {
+            "workspace_id": "ws_main",
+            "repos": [
+                {
+                    "repo_id": "project_cloud",
+                    "root": "repos/project_cloud",
+                    "remote_url": "https://platgit.mihoyo.com/cloud_game/nxg_cloud.git",
+                }
+            ],
+        }
+    )
+    assert resolve_repo_id_for_project_path("cloud_game/nxg_cloud", mf) == "project_cloud"

@@ -80,12 +80,28 @@ class PydanticAiPlannerService:
     def __init__(self, endpoint: LlmEndpoint) -> None:
         from pydantic_ai import Agent  # type: ignore
 
+        self._endpoint = endpoint
         self._agent = Agent(_build_agent_model(endpoint), system_prompt=PLANNER_SYSTEM_PROMPT, output_type=ReviewPlan)
 
     def plan(self, *, context, prepass, budgets: dict[str, int]) -> ReviewPlan:
         try:
+            logger.info(
+                "planner start provider=%s model=%s changed_files=%d seed_symbols=%d",
+                self._endpoint.provider,
+                self._endpoint.model_name,
+                len(prepass.changed_files),
+                len(prepass.seed_symbols),
+            )
             prompt = build_planner_prompt(context=context, prepass=prepass, budgets=budgets)
-            return _result_output(self._agent.run_sync(prompt), ReviewPlan)
+            result = _result_output(self._agent.run_sync(prompt), ReviewPlan)
+            logger.info(
+                "planner complete provider=%s model=%s prioritized_symbols=%d require_merge_preview=%s",
+                self._endpoint.provider,
+                self._endpoint.model_name,
+                len(result.prioritized_symbols),
+                result.require_merge_preview,
+            )
+            return result
         except Exception as exc:
             raise ModelContractError(str(exc)) from exc
 
@@ -96,12 +112,28 @@ class PydanticAiSynthesisService:
     def __init__(self, endpoint: LlmEndpoint) -> None:
         from pydantic_ai import Agent  # type: ignore
 
+        self._endpoint = endpoint
         self._agent = Agent(_build_agent_model(endpoint), system_prompt=SYNTHESIS_SYSTEM_PROMPT, output_type=SynthesisDraft)
 
     def synthesize(self, *, fact_sheet: ReviewFactSheet, fail_threshold: str) -> SynthesisDraft:
         try:
+            logger.info(
+                "synthesis start provider=%s model=%s symbol_facts=%d evidence=%d",
+                self._endpoint.provider,
+                self._endpoint.model_name,
+                len(fact_sheet.symbol_facts),
+                len(fact_sheet.evidence_anchors),
+            )
             prompt = build_synthesis_prompt(fact_sheet=fact_sheet, fail_threshold=fail_threshold)
-            return _result_output(self._agent.run_sync(prompt), SynthesisDraft)
+            result = _result_output(self._agent.run_sync(prompt), SynthesisDraft)
+            logger.info(
+                "synthesis complete provider=%s model=%s findings=%d notes=%d",
+                self._endpoint.provider,
+                self._endpoint.model_name,
+                len(result.findings),
+                len(result.global_notes),
+            )
+            return result
         except Exception as exc:
             raise ModelContractError(str(exc)) from exc
 
@@ -124,6 +156,14 @@ class PydanticAiExplorationService:
         tool_usage: list,
         analysis_context: dict[str, Any],
     ) -> ExplorationResult:
+        logger.info(
+            "exploration start provider=%s model=%s remaining_calls=%d remaining_rounds=%d symbols=%d",
+            self._endpoint.provider,
+            self._endpoint.model_name,
+            remaining_calls,
+            remaining_rounds,
+            len(fact_sheet.symbol_facts),
+        )
         prompt = build_exploration_prompt(
             fact_sheet=fact_sheet,
             prepass=prepass,
@@ -143,8 +183,21 @@ class PydanticAiExplorationService:
             raise ModelContractError(str(exc)) from exc
         data = _result_output(result, ExplorationResult | str)
         if isinstance(data, ExplorationResult):
+            logger.info(
+                "exploration complete provider=%s model=%s new_evidence=%d warnings=%d summary=%s",
+                self._endpoint.provider,
+                self._endpoint.model_name,
+                len(data.new_evidence),
+                len(data.warnings),
+                "yes" if bool(data.summary.strip()) else "no",
+            )
             return data
         if isinstance(data, str):
+            logger.info(
+                "exploration complete provider=%s model=%s string_summary=yes",
+                self._endpoint.provider,
+                self._endpoint.model_name,
+            )
             return ExplorationResult(summary=data)
         raise ModelContractError(f"unexpected exploration result type: {type(data).__name__}")
 

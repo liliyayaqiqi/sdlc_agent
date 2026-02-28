@@ -96,4 +96,16 @@ $env:OPENROUTER_API_KEY="<openrouter-token>"
 
 ## Environment
 
-See `.env.example` for defaults.
+The CLI auto-loads the nearest `.env` file from the current working directory upward using `python-dotenv`. Existing exported environment variables still win over `.env` values.
+
+Typical local `.env`:
+
+```dotenv
+REVIEW_AGENT_LLM_MODEL=gateway:claude-sonnet-4-5
+REVIEW_AGENT_LLM_BASE_URL=https://router.example.com/v1
+REVIEW_AGENT_LLM_API_KEY=<router-token>
+REVIEW_AGENT_CXXTRACT_BASE_URL=http://127.0.0.1:8000
+REVIEW_AGENT_GITLAB_TOKEN=<gitlab-token>
+```
+
+See `.env.example` for the full set of defaults.

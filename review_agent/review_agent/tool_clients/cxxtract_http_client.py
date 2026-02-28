@@ -155,7 +155,7 @@ class CxxtractHttpClient:
             "workspace_id": self.workspace_id,
             "query": query,
             "mode": mode,
-            "scope": scope or {"entry_repos": [], "max_repo_hops": 2},
+            "scope": scope or {"entry_repos": [], "max_repo_hops": 2, "path_prefixes": []},
             "max_hits": max_hits,
             "max_files": max_files,
             "timeout_s": timeout_s,
@@ -173,12 +173,17 @@ class CxxtractHttpClient:
         include_rg: bool = True,
         entry_repos: list[str] | None = None,
         max_repo_hops: int = 2,
+        path_prefixes: list[str] | None = None,
         analysis_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "workspace_id": self.workspace_id,
             "symbol": symbol,
-            "scope": {"entry_repos": entry_repos or [], "max_repo_hops": max_repo_hops},
+            "scope": {
+                "entry_repos": entry_repos or [],
+                "max_repo_hops": max_repo_hops,
+                "path_prefixes": path_prefixes or [],
+            },
             "max_files": max_files,
             "include_rg": include_rg,
         }

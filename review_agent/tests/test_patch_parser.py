@@ -59,3 +59,63 @@ def test_build_prepass_result_extracts_seeds_and_calls():
     assert any(seed.symbol == "auth::Session::Start" for seed in prepass.seed_symbols)
     assert "doLogin" in prepass.added_call_sites
     assert any(anchor.kind in {"atomic", "concurrency"} for anchor in prepass.suspicious_anchors)
+
+
+def test_build_prepass_result_filters_std_and_system_noise():
+    patch = """diff --git a/src/name_pipe.cpp b/src/name_pipe.cpp
+--- a/src/name_pipe.cpp
++++ b/src/name_pipe.cpp
+@@ -1 +1,6 @@
++if (initialized_.load()) {
++  LOG_ERROR("bad");
++  auto cb = std::move(handler);
++  SetEvent(h_stop_event_);
++  handleMessage();
++}
+"""
+    changes = parse_unified_diff(patch)
+    prepass = build_prepass_result(changes, max_symbols=16)
+    seed_symbols = {seed.symbol for seed in prepass.seed_symbols}
+    assert "handleMessage" in seed_symbols
+    assert "load" not in seed_symbols
+    assert "SetEvent" not in seed_symbols
+    assert "std::move" not in seed_symbols
+    assert "LOG_ERROR" not in seed_symbols
+    assert "handleMessage" in prepass.added_call_sites
+    assert "load" not in prepass.added_call_sites
+    assert "initialized_.load" in prepass.added_call_sites
+    assert any(call.receiver == "initialized_" and call.member == "load" for call in prepass.member_call_sites)
+    assert prepass.changed_methods == []
+
+
+def test_build_prepass_result_keeps_user_defined_load_declaration():
+    patch = """diff --git a/src/loader.cpp b/src/loader.cpp
+--- a/src/loader.cpp
++++ b/src/loader.cpp
+@@ -1 +1,4 @@
++bool load() {
++  return readConfig();
++}
+ """
+    changes = parse_unified_diff(patch)
+    prepass = build_prepass_result(changes, max_symbols=8)
+    assert any(decl.symbol == "load" for decl in prepass.changed_declarations)
+    assert any(seed.symbol == "load" and seed.relevance_tier == "declaration" for seed in prepass.seed_symbols)
+
+
+def test_build_prepass_result_distinguishes_declarations_from_member_calls():
+    patch = """diff --git a/src/controller.cpp b/src/controller.cpp
+--- a/src/controller.cpp
++++ b/src/controller.cpp
+@@ -1 +1,5 @@
++class Controller {
++ public:
++  void Run();
++};
++foo.bar();
+ """
+    changes = parse_unified_diff(patch)
+    prepass = build_prepass_result(changes, max_symbols=12)
+    assert "Controller::Run" in prepass.changed_methods
+    assert "foo.bar" in prepass.added_call_sites
+    assert all(decl.symbol != "bar" for decl in prepass.changed_declarations)

@@ -9,6 +9,8 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import find_dotenv, load_dotenv
+
 from review_agent.adapters.gitlab import GitLabPublisher
 from review_agent.config import AgentSettings
 from review_agent.models import (
@@ -31,6 +33,7 @@ EXIT_INDETERMINATE = 3
 
 def main(argv: list[str] | None = None) -> int:
     """Run CLI command and return process exit code."""
+    _load_runtime_dotenv()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -45,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         level=numeric_level,
         format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
+        force=True,
     )
 
     patch_text, context_bundle = _load_inputs(args)
@@ -79,6 +83,15 @@ def main(argv: list[str] | None = None) -> int:
         workspace_fingerprint=args.workspace_fingerprint or "",
     )
 
+    logger.info(
+        "starting review workspace=%s model=%s cache=%s gitlab_mr=%s out_dir=%s",
+        request.workspace_id,
+        request.llm_model,
+        "on" if request.enable_cache else "off",
+        bool(args.gitlab_url and args.project_id and args.mr_iid),
+        args.out_dir,
+    )
+
     orchestrator = ReviewOrchestrator()
     try:
         report = orchestrator.run(request)
@@ -90,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir).resolve()
 
     if args.gitlab_url and args.project_id and args.mr_iid:
-        token = args.gitlab_token or os.getenv("REVIEW_AGENT_GITLAB_TOKEN", "")
+        token = args.gitlab_token or settings.gitlab_token
         try:
             publisher = GitLabPublisher(
                 base_url=args.gitlab_url,
@@ -187,7 +200,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _load_inputs(args: argparse.Namespace) -> tuple[str, ReviewContextBundle | None]:
     if getattr(args, "gitlab_url", "") and getattr(args, "project_id", "") and getattr(args, "mr_iid", ""):
-        gitlab_token = getattr(args, "gitlab_token", "") or os.getenv("REVIEW_AGENT_GITLAB_TOKEN", "")
+        settings = AgentSettings.from_env()
+        gitlab_token = getattr(args, "gitlab_token", "") or settings.gitlab_token
         if not gitlab_token:
             raise ValueError("--gitlab-token or REVIEW_AGENT_GITLAB_TOKEN environment variable required for GitLab mode")
         return _load_from_gitlab(args, gitlab_token)
@@ -287,6 +301,19 @@ def _load_patch_text(args: argparse.Namespace) -> str:
             raise ValueError(f"patch file is empty: {p}")
         return data
     return ""
+
+
+def _load_runtime_dotenv() -> None:
+    """Load .env via python-dotenv unless explicitly disabled."""
+    if os.getenv("REVIEW_AGENT_DISABLE_DOTENV", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    explicit = os.getenv("REVIEW_AGENT_ENV_FILE", "").strip()
+    if explicit:
+        load_dotenv(dotenv_path=explicit, override=False)
+        return
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
 if __name__ == "__main__":

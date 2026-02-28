@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path, PurePosixPath
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger("review_agent.manifest_resolver")
 
@@ -18,6 +19,8 @@ class ManifestRepo(BaseModel):
     repo_id: str
     root: str
     depends_on: list[str] = Field(default_factory=list)
+    remote_url: str = ""
+    project_path: str = ""
 
 
 class WorkspaceManifest(BaseModel):
@@ -98,6 +101,22 @@ def dependency_map(manifest: WorkspaceManifest) -> dict[str, set[str]]:
     return {repo.repo_id: set(repo.depends_on) for repo in manifest.repos}
 
 
+def resolve_repo_id_for_project_path(project_path: str, manifest: WorkspaceManifest) -> str:
+    """Resolve a GitLab project path or URL to the manifest repo_id."""
+    normalized = _normalize_project_path(project_path)
+    if not normalized:
+        return ""
+    for repo in manifest.repos:
+        candidates = {
+            _normalize_project_path(repo.repo_id),
+            _normalize_project_path(repo.project_path),
+            _normalize_project_path(repo.remote_url),
+        }
+        if normalized in candidates:
+            return repo.repo_id
+    return ""
+
+
 def _normalize_rel(path_text: str) -> str:
     text = path_text.strip().replace("\\", "/")
     if text.startswith("a/") or text.startswith("b/"):
@@ -109,3 +128,15 @@ def _normalize_rel(path_text: str) -> str:
         return ""
     return "/".join(parts)
 
+
+def _normalize_project_path(value: str) -> str:
+    text = (value or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        text = parsed.path
+    text = text.strip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    return text

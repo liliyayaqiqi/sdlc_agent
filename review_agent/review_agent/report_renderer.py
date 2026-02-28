@@ -33,6 +33,11 @@ def render_markdown(report: ReviewReport) -> str:
     if report.run_metadata:
         lines.append(f"- Agent version: `{report.run_metadata.agent_version}`")
         lines.append(f"- Input mode: `{report.run_metadata.input_mode}`")
+        if report.run_metadata.prepass_debug is not None:
+            lines.append(
+                f"- Pre-pass debug: `{len(report.run_metadata.prepass_debug.ranked_seed_candidates)}` seeds / "
+                f"`{len(report.run_metadata.prepass_debug.changed_declarations)}` declarations"
+            )
 
     lines.append("")
     lines.append("## Summary")
@@ -83,6 +88,8 @@ def render_markdown(report: ReviewReport) -> str:
         lines.append(f"- Changed hunks: `{report.fact_sheet.changed_hunk_count}`")
         lines.append(f"- Seed symbols: `{len(report.fact_sheet.seed_symbols)}`")
         lines.append(f"- Suspicious anchors: `{len(report.fact_sheet.suspicious_anchors)}`")
+        lines.append(f"- Changed declarations: `{len(report.fact_sheet.changed_declarations)}`")
+        lines.append(f"- Member call sites: `{len(report.fact_sheet.member_call_sites)}`")
 
         if report.fact_sheet.merge_analysis_degraded:
             lines.append("- ⚠ Merge-aware analysis: `degraded`")
@@ -106,6 +113,30 @@ def render_markdown(report: ReviewReport) -> str:
             lines.append("- Fact-sheet warnings:")
             for warn in report.fact_sheet.warnings[:20]:
                 lines.append(f"  - {warn}")
+        lines.append("")
+
+    if report.run_metadata and report.run_metadata.prepass_debug is not None:
+        debug = report.run_metadata.prepass_debug
+        lines.append("## Pre-pass Debug")
+        lines.append("")
+        if debug.ranked_seed_candidates:
+            lines.append("- Top ranked seeds:")
+            for seed in debug.ranked_seed_candidates[:10]:
+                lines.append(
+                    f"  - `{seed.symbol}` [{seed.relevance_tier}] score={seed.score:.2f} "
+                    f"reasons={', '.join(seed.reasons[:3])}"
+                )
+        if debug.diff_excerpt_reasons:
+            lines.append("- Diff excerpt reasons:")
+            for reason in debug.diff_excerpt_reasons[:10]:
+                lines.append(f"  - {reason}")
+        if debug.retrieval_widening_events:
+            lines.append("- Retrieval widening:")
+            for event in debug.retrieval_widening_events[:10]:
+                lines.append(
+                    f"  - `{event.get('symbol', '?')}` -> `{event.get('stage', '?')}` "
+                    f"(candidates={event.get('candidate_count', 0)})"
+                )
         lines.append("")
 
     if report.test_impact is not None:

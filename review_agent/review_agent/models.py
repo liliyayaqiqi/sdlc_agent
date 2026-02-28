@@ -15,13 +15,16 @@ from pydantic import BaseModel, Field, model_validator
 
 AGENT_VERSION = "0.3.1"
 PROMPT_VERSION = "2026-02-28"
-PARSER_VERSION = "1"
+PARSER_VERSION = "2"
 
 SUPPORTED_MODEL_PROVIDERS = {"openai", "openrouter", "gateway", "openai-compatible", "fixture"}
 
 ReviewConfidence = Literal["high", "medium", "low"]
 FindingLocationSide = Literal["new", "old"]
 RepoRevisionRole = Literal["primary", "dependency", "auxiliary"]
+SeedRelevanceTier = Literal["declaration", "qualified", "receiver_owned", "generic_fallback"]
+DeclarationKind = Literal["function", "method", "constructor", "destructor", "class", "struct", "enum"]
+DiffLineKind = Literal["add", "del"]
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +251,44 @@ class SeedSymbol(BaseModel):
     source: str
     file_key: str = ""
     score: float = 0.0
+    relevance_tier: SeedRelevanceTier = "generic_fallback"
+    reasons: list[str] = Field(default_factory=list)
+    receiver: str = ""
+    container: str = ""
+    file_paths: list[str] = Field(default_factory=list)
+
+
+class ChangedDeclaration(BaseModel):
+    """Declaration-like symbol added or modified in the patch."""
+
+    symbol: str
+    container: str = ""
+    kind: DeclarationKind = "function"
+    file_path: str
+    line: int = 0
+
+
+class MemberCallSite(BaseModel):
+    """Member call extracted from changed lines."""
+
+    member: str
+    receiver: str
+    container: str = ""
+    file_path: str
+    line: int = 0
+    line_kind: DiffLineKind = "add"
+    qualified_receiver_type: str = ""
+
+
+class DiffExcerpt(BaseModel):
+    """Planner-facing excerpt from one changed hunk."""
+
+    file_path: str
+    hunk_header: str
+    start_line: int = 0
+    end_line: int = 0
+    text: str = ""
+    reason: str = ""
 
 
 class SuspiciousAnchor(BaseModel):
@@ -267,6 +308,10 @@ class PrepassResult(BaseModel):
     changed_hunk_count: int = 0
     seed_symbols: list[SeedSymbol] = Field(default_factory=list)
     suspicious_anchors: list[SuspiciousAnchor] = Field(default_factory=list)
+    changed_declarations: list[ChangedDeclaration] = Field(default_factory=list)
+    changed_containers: list[str] = Field(default_factory=list)
+    member_call_sites: list[MemberCallSite] = Field(default_factory=list)
+    diff_excerpts: list[DiffExcerpt] = Field(default_factory=list)
     changed_methods: list[str] = Field(default_factory=list)
     added_call_sites: list[str] = Field(default_factory=list)
     removed_call_sites: list[str] = Field(default_factory=list)
@@ -387,6 +432,9 @@ class ReviewFactSheet(BaseModel):
     changed_hunk_count: int = 0
     seed_symbols: list[str] = Field(default_factory=list)
     suspicious_anchors: list[SuspiciousAnchor] = Field(default_factory=list)
+    changed_declarations: list[ChangedDeclaration] = Field(default_factory=list)
+    changed_containers: list[str] = Field(default_factory=list)
+    member_call_sites: list[MemberCallSite] = Field(default_factory=list)
     changed_methods: list[str] = Field(default_factory=list)
     added_call_sites: list[str] = Field(default_factory=list)
     removed_call_sites: list[str] = Field(default_factory=list)
@@ -424,6 +472,15 @@ ReviewTestImpact.__test__ = False
 # Run metadata and cache envelope
 # ---------------------------------------------------------------------------
 
+class PrepassDebug(BaseModel):
+    """Compact debug summary for understanding pre-pass behavior."""
+
+    ranked_seed_candidates: list[SeedSymbol] = Field(default_factory=list)
+    changed_declarations: list[ChangedDeclaration] = Field(default_factory=list)
+    member_call_sites_top: list[MemberCallSite] = Field(default_factory=list)
+    diff_excerpt_reasons: list[str] = Field(default_factory=list)
+    retrieval_widening_events: list[dict[str, Any]] = Field(default_factory=list)
+
 class RunMetadata(BaseModel):
     """Versioning envelope included in cache keys and report output."""
 
@@ -433,6 +490,7 @@ class RunMetadata(BaseModel):
     input_mode: str = ""  # "patch_file", "context_bundle", "gitlab_mr"
     run_id: str = ""
     backend_base_url: str = ""
+    prepass_debug: PrepassDebug | None = None
 
 
 # ---------------------------------------------------------------------------

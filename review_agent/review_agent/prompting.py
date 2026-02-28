@@ -23,21 +23,27 @@ The user message contains deterministic signals extracted from the patch
 before any LLM reasoning:
 
 * **seed_symbols** -- ranked symbols extracted from added/deleted lines.
-  Higher-scored symbols appear more frequently in the diff.
+  Each symbol includes a relevance tier and reasons explaining why it was
+  promoted.
 * **suspicious_anchors** -- lines that touch concurrency primitives
   (mutex, atomic), lifetime management (unique_ptr, delete),
   exception flow (throw/catch), or ABI/dispatch (virtual/override).
   These are high-priority review targets.
-* **changed_methods** -- method/function signatures that were added or
-  modified in the diff.
-* **added_call_sites / removed_call_sites** -- call-site names that
-  were introduced or removed.  A removed call-site that still has
+* **changed_declarations** -- declaration-like symbols that were added or
+  modified in the diff, including classes/structs/enums.
+* **member_call_sites** -- member-style calls observed in changed code.
+  When these reference generic APIs like `.load()`, prefer the owning
+  declaration/container rather than the bare member name.
+* **added_call_sites / removed_call_sites** -- planner-facing call-site
+  hints that were introduced or removed. A removed call-site that still has
   references elsewhere is a potential hidden side-effect.
 * **include_macro_config_changes** -- files where #include, #define,
   or build config changed.  These can have wide blast radius.
+* **diff_context** -- curated raw diff context. Use this to disambiguate
+  generic APIs that are only meaningful inside the changed container.
 
 Use these as the PRIMARY signal for prioritizing symbols.
-Prefer symbols that appear in suspicious anchors or have high seed scores.
+Prefer declaration/container-owned symbols over bare generic call names.
 Keep the plan bounded by the provided budgets.
 
 ## Merge-awareness
@@ -136,7 +142,16 @@ def build_planner_prompt(
         "changed_files": prepass.changed_files[:300],
         "changed_hunk_count": prepass.changed_hunk_count,
         "seed_symbols": [
-            {"symbol": s.symbol, "source": s.source, "score": s.score}
+            {
+                "symbol": s.symbol,
+                "source": s.source,
+                "score": s.score,
+                "tier": s.relevance_tier,
+                "reasons": s.reasons[:6],
+                "receiver": s.receiver,
+                "container": s.container,
+                "file_paths": s.file_paths[:6],
+            }
             for s in prepass.seed_symbols[:60]
         ],
         "suspicious_anchor_summary": anchor_summary,
@@ -144,10 +159,33 @@ def build_planner_prompt(
             {"kind": a.kind, "file": a.file_path, "line": a.line, "snippet": a.snippet[:120]}
             for a in prepass.suspicious_anchors[:30]
         ],
+        "changed_declarations": [
+            {
+                "symbol": decl.symbol,
+                "container": decl.container,
+                "kind": decl.kind,
+                "file": decl.file_path,
+                "line": decl.line,
+            }
+            for decl in prepass.changed_declarations[:100]
+        ],
+        "changed_containers": prepass.changed_containers[:80],
+        "member_call_sites": [
+            {
+                "receiver": call.receiver,
+                "member": call.member,
+                "container": call.container,
+                "qualified_receiver_type": call.qualified_receiver_type,
+                "file": call.file_path,
+                "line": call.line,
+            }
+            for call in prepass.member_call_sites[:80]
+        ],
         "changed_methods": prepass.changed_methods[:100],
         "added_call_sites": prepass.added_call_sites[:100],
         "removed_call_sites": prepass.removed_call_sites[:100],
         "include_macro_config_changes": prepass.include_macro_config_changes[:80],
+        "diff_context": _planner_diff_payload(context=context, prepass=prepass),
         "budgets": budgets,
     }
 
@@ -166,6 +204,42 @@ def build_planner_prompt(
 
     sections.append(json.dumps(payload, indent=2, ensure_ascii=True))
     return "\n\n".join(sections)
+
+
+def _planner_diff_payload(*, context: ReviewContextBundle, prepass: PrepassResult) -> dict[str, Any]:
+    patch_text = context.patch_text or ""
+    changed_line_count = _count_changed_lines(patch_text)
+    if patch_text and len(patch_text.encode("utf-8")) <= 8 * 1024 and changed_line_count <= 200:
+        return {
+            "mode": "full_diff",
+            "changed_line_count": changed_line_count,
+            "patch_text": patch_text,
+        }
+    return {
+        "mode": "excerpts",
+        "changed_line_count": changed_line_count,
+        "excerpts": [
+            {
+                "file": excerpt.file_path,
+                "hunk_header": excerpt.hunk_header,
+                "start_line": excerpt.start_line,
+                "end_line": excerpt.end_line,
+                "reason": excerpt.reason,
+                "text": excerpt.text,
+            }
+            for excerpt in prepass.diff_excerpts[:30]
+        ],
+    }
+
+
+def _count_changed_lines(patch_text: str) -> int:
+    count = 0
+    for line in patch_text.splitlines():
+        if line.startswith(("+++", "---", "@@")):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            count += 1
+    return count
 
 
 def build_synthesis_prompt(*, fact_sheet: ReviewFactSheet, fail_threshold: str) -> str:

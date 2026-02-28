@@ -36,6 +36,7 @@ from review_agent.models import (
 )
 from review_agent.orchestrator import (
     BudgetTracker,
+    RetrievalStage,
     ReviewOrchestrator,
     ViewContexts,
     _analyze_test_impact,
@@ -45,6 +46,7 @@ from review_agent.orchestrator import (
     _empty_impact,
     _indeterminate_report,
     _is_merge_degraded,
+    _normalize_bundle_and_scope_repos,
     _policy_gate,
     _workspace_lock,
 )
@@ -143,6 +145,21 @@ class _UnreachableClient(_NullClient):
         raise ConnectionError("connection refused")
 
 
+class _ScopedClient(_NullClient):
+    def __init__(self):
+        super().__init__()
+        self.rg_calls: list[dict] = []
+        self.list_calls: list[dict] = []
+
+    def explore_rg_search(self, **kw):
+        self.rg_calls.append(kw)
+        return {"hits": []}
+
+    def explore_list_candidates(self, **kw):
+        self.list_calls.append(kw)
+        return {"candidates": []}
+
+
 class TestBudgetExhaustion:
     def test_collect_symbol_stops_early_when_budget_exhausted(self):
         budget = _budget(calls=1)
@@ -160,6 +177,79 @@ class TestBudgetExhaustion:
         impact = _empty_impact("Sym", rg_hits=[{"file_key": "a.cpp"}])
         assert impact.symbol == "Sym"
         assert "budget_exhausted_mid_symbol" in impact.warnings
+
+    def test_collect_symbol_passes_repo_scope(self):
+        client = _ScopedClient()
+        budget = _budget(calls=20)
+        _collect_symbol(
+            client,
+            None,
+            {"mode": "pr"},
+            "ScopedSymbol",
+            [],
+            budget,
+            retrieval_stages=[
+                RetrievalStage(
+                    name="exact_paths",
+                    entry_repos=["repoA"],
+                    max_repo_hops=0,
+                    path_prefixes=["src/module"],
+                )
+            ],
+        )
+        assert client.rg_calls[0]["scope"] == {
+            "entry_repos": ["repoA"],
+            "max_repo_hops": 0,
+            "path_prefixes": ["src/module"],
+        }
+        assert client.list_calls[0]["entry_repos"] == ["repoA"]
+        assert client.list_calls[0]["max_repo_hops"] == 0
+        assert client.list_calls[0]["path_prefixes"] == ["src/module"]
+
+
+class TestRepoScoping:
+    def test_normalize_bundle_and_scope_repos_uses_manifest_repo_id(self, tmp_path):
+        workspace_root = tmp_path / "ws"
+        repo_root = workspace_root / "repos" / "project_cloud" / "src"
+        repo_root.mkdir(parents=True, exist_ok=True)
+        (repo_root / "app.cpp").write_text("int app();", encoding="utf-8")
+        manifest_path = workspace_root / "workspace.yaml"
+        manifest_path.write_text(
+            "\n".join(
+                [
+                    "workspace_id: ws",
+                    "repos:",
+                    "  - repo_id: project_cloud",
+                    "    root: repos/project_cloud",
+                    "    remote_url: https://platgit.mihoyo.com/cloud_game/nxg_cloud.git",
+                    "    depends_on: [webrtc]",
+                    "  - repo_id: webrtc",
+                    "    root: repos/webrtc",
+                    "    depends_on: []",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        bundle = ReviewContextBundle(
+            workspace_id="ws",
+            patch_text="diff --git a/repos/project_cloud/src/app.cpp b/repos/project_cloud/src/app.cpp\n",
+            primary_repo_id="cloud_game/nxg_cloud",
+            repo_revisions=[RepoRevisionContext(repo_id="cloud_game/nxg_cloud", target_sha="a" * 40)],
+        )
+        normalized, entry_repos, warnings = _normalize_bundle_and_scope_repos(
+            workspace={
+                "workspace_id": "ws",
+                "root_path": str(workspace_root),
+                "manifest_path": str(manifest_path),
+                "repos": ["project_cloud", "webrtc"],
+            },
+            bundle=bundle,
+            changed_files=["repos/project_cloud/src/app.cpp"],
+        )
+        assert normalized.primary_repo_id == "project_cloud"
+        assert normalized.repo_revisions[0].repo_id == "project_cloud"
+        assert entry_repos == ["project_cloud"]
+        assert warnings == []
 
 
 class TestCache:
@@ -245,7 +335,7 @@ class TestCache:
                 "max_fetch_limit": 2000,
                 "agent_version": "0.3.1",
                 "prompt_version": "2026-02-28",
-                "parser_version": "1",
+                "parser_version": "2",
             },
         )
         cache.save(key, {"review_report": report.model_dump(mode="json")})

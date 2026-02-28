@@ -10,6 +10,8 @@ build/
 .review_agent_cache/
 .workspace_locks/
 review_agent_output/
+out/
+out_*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

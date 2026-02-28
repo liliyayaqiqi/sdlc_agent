@@ -139,11 +139,13 @@ def test_explore_candidates_accepts_analysis_context():
         client.explore_list_candidates(
             symbol="foo",
             max_files=10,
+            path_prefixes=["src/module"],
             analysis_context={"mode": "pr", "context_id": "ctx1"},
         )
 
     assert captured["url"].endswith("/explore/list-candidates")
     assert captured["json"]["analysis_context"]["context_id"] == "ctx1"
+    assert captured["json"]["scope"]["path_prefixes"] == ["src/module"]
 
 
 def test_gitlab_get_retries_on_transient_error():

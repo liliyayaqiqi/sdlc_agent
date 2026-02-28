@@ -20,6 +20,7 @@ class AgentSettings(BaseModel):
     llm_api_key: str = Field(default="", repr=False)
     llm_app_url: str = ""
     llm_app_title: str = ""
+    gitlab_token: str = Field(default="", repr=False)
     cxxtract_base_url: str = "http://127.0.0.1:8000"
     fail_on_severity: Severity = Severity.HIGH
     max_symbols: int = Field(default=24, ge=1, le=100)
@@ -49,6 +50,7 @@ class AgentSettings(BaseModel):
             llm_api_key=os.getenv("REVIEW_AGENT_LLM_API_KEY", "").strip(),
             llm_app_url=os.getenv("REVIEW_AGENT_LLM_APP_URL", "").strip(),
             llm_app_title=os.getenv("REVIEW_AGENT_LLM_APP_TITLE", "").strip(),
+            gitlab_token=os.getenv("REVIEW_AGENT_GITLAB_TOKEN", "").strip(),
             cxxtract_base_url=os.getenv("REVIEW_AGENT_CXXTRACT_BASE_URL", "http://127.0.0.1:8000").strip(),
             fail_on_severity=fail,
             max_symbols=int(os.getenv("REVIEW_AGENT_MAX_SYMBOLS", "24")),

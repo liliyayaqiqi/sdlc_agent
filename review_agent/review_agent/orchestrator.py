@@ -7,6 +7,7 @@ from hashlib import sha1
 import json
 import logging
 import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 from time import perf_counter, sleep, time
@@ -17,6 +18,12 @@ from review_agent.application.pipeline import ReviewPipeline
 from review_agent.context_ingestion import IngestedReviewContext, ReviewContextIngestor
 from review_agent.domain.location_mapper import FindingLocationMapper
 from review_agent.domain.policy import finalize_report, indeterminate_report
+from review_agent.manifest_resolver import (
+    load_workspace_manifest,
+    repo_for_file_key,
+    resolve_file_key,
+    resolve_repo_id_for_project_path,
+)
 from review_agent.models import (
     AGENT_VERSION,
     CoverageSummary,
@@ -25,6 +32,7 @@ from review_agent.models import (
     InputNormalizationError,
     ModelContractError,
     PARSER_VERSION,
+    PrepassDebug,
     PROMPT_VERSION,
     RepoRevisionContext,
     ReviewExecutionStatus,
@@ -125,6 +133,16 @@ class ViewContexts:
     head: dict[str, Any]
     merge_preview: dict[str, Any] | None
     status: ViewContextMaterialization
+
+
+@dataclass(frozen=True)
+class RetrievalStage:
+    """One candidate-discovery widening stage."""
+
+    name: str
+    entry_repos: list[str]
+    max_repo_hops: int
+    path_prefixes: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +267,7 @@ class ReviewOrchestrator:
     ) -> ReviewReport:
         # Determine input mode for metadata
         input_mode = _detect_input_mode(request)
+        logger.info("[%s] review start workspace=%s input_mode=%s", run_id, request.workspace_id, input_mode)
 
         run_metadata = RunMetadata(
             input_mode=input_mode,
@@ -263,6 +282,13 @@ class ReviewOrchestrator:
             raise InfrastructureError(
                 f"CXXtract backend unreachable at {client.base_url}; is the service running? ({exc})"
             ) from exc
+        logger.info(
+            "[%s] workspace connected backend=%s workspace_id=%s root=%s",
+            run_id,
+            client.base_url,
+            workspace.get("workspace_id", request.workspace_id),
+            workspace.get("root_path", ""),
+        )
 
         ws_id = str(workspace.get("workspace_id", "")).strip() or request.workspace_id
         if ws_id != request.workspace_id:
@@ -281,6 +307,15 @@ class ReviewOrchestrator:
             )
 
         prepass = build_prepass_result(changes, max_symbols=runtime.max_symbols)
+        logger.info(
+            "[%s] prepass complete changed_files=%d hunks=%d declarations=%d seeds=%d suspicious=%d",
+            run_id,
+            len(prepass.changed_files),
+            prepass.changed_hunk_count,
+            len(prepass.changed_declarations),
+            len(prepass.seed_symbols),
+            len(prepass.suspicious_anchors),
+        )
         if not bundle.changed_files:
             bundle.changed_files = list(prepass.changed_files)
         if not bundle.changed_hunks:
@@ -297,6 +332,38 @@ class ReviewOrchestrator:
             ][:1000]
 
         _check_deadline(deadline, "context_ingestion")
+
+        bundle, entry_repos, scope_warnings = _normalize_bundle_and_scope_repos(
+            workspace=workspace,
+            bundle=bundle,
+            changed_files=prepass.changed_files,
+        )
+        if scope_warnings:
+            prepass.warnings.extend(scope_warnings)
+        run_metadata = run_metadata.model_copy(
+            update={
+                "prepass_debug": PrepassDebug(
+                    ranked_seed_candidates=prepass.seed_symbols[:24],
+                    changed_declarations=prepass.changed_declarations[:40],
+                    member_call_sites_top=prepass.member_call_sites[:40],
+                    diff_excerpt_reasons=[excerpt.reason for excerpt in prepass.diff_excerpts[:20]],
+                    retrieval_widening_events=[],
+                )
+            }
+        )
+        retrieval_stages = _build_retrieval_stages(
+            workspace=workspace,
+            bundle=bundle,
+            prepass=prepass,
+            entry_repos=entry_repos,
+        )
+        logger.info(
+            "[%s] scope resolved entry_repos=%s retrieval_stages=%s",
+            run_id,
+            entry_repos or [],
+            [stage.name for stage in retrieval_stages],
+        )
+        retrieval_widening_events: list[dict[str, Any]] = []
 
         # --- Cache lookup BEFORE view materialization ---
         cache = ReviewTraceCache(runtime.cache_dir) if runtime.enable_cache else None
@@ -333,11 +400,21 @@ class ReviewOrchestrator:
             if cached is not None:
                 logger.info("[%s] cache hit for key %s", run_id, cache_key[:16])
                 return cached
+            logger.info("[%s] cache miss for key %s", run_id, cache_key[:16])
 
         # --- View materialization (only on cache miss) ---
+        logger.info("[%s] preparing views", run_id)
         views = self._prepare_views(
             client=client, runtime_context=bundle,
             lock_root=runtime.cache_dir, created_context_ids=created_context_ids, run_id=run_id,
+        )
+        logger.info(
+            "[%s] views ready baseline=%s head=%s merge=%s warnings=%d",
+            run_id,
+            views.status.baseline_materialized,
+            views.status.head_materialized,
+            views.status.merge_preview_materialized,
+            len(views.status.warnings),
         )
         tool_usage: list[ToolCallRecord] = []
 
@@ -353,6 +430,7 @@ class ReviewOrchestrator:
 
         # --- Step 1: LLM Planner ---
         _check_deadline(deadline, "planner")
+        logger.info("[%s] planner step start", run_id)
         planner, exploration, synthesis = self._services_for(request)
         try:
             plan = planner.plan(
@@ -370,12 +448,50 @@ class ReviewOrchestrator:
             )
         except Exception as exc:
             logger.warning("[%s] planner failed, using seed-symbol fallback: %s", run_id, exc)
-            plan = ReviewPlan(prioritized_symbols=[s.symbol for s in prepass.seed_symbols[: runtime.max_symbols]])
+            plan = ReviewPlan(prioritized_symbols=_fallback_prioritized_symbols(prepass, runtime.max_symbols))
+        logger.info(
+            "[%s] planner step complete prioritized_symbols=%d sample=%s",
+            run_id,
+            len(plan.prioritized_symbols),
+            plan.prioritized_symbols[:5],
+        )
 
         # --- Step 2: Deterministic base evidence collection ---
         _check_deadline(deadline, "evidence_collection")
+        logger.info(
+            "[%s] evidence collection start max_calls=%d max_slots=%d",
+            run_id,
+            budget.max_total_tool_calls,
+            budget.max_symbol_slots,
+        )
         impacts, symbol_facts, coverage = self._collect_evidence(
-            client, runtime, views, prepass, plan, tool_usage, budget, deadline,
+            client,
+            runtime,
+            views,
+            prepass,
+            plan,
+            tool_usage,
+            budget,
+            deadline,
+            retrieval_stages=retrieval_stages,
+            widening_events=retrieval_widening_events,
+        )
+        if run_metadata.prepass_debug is not None:
+            run_metadata = run_metadata.model_copy(
+                update={
+                    "prepass_debug": run_metadata.prepass_debug.model_copy(
+                        update={"retrieval_widening_events": retrieval_widening_events[:100]}
+                    )
+                }
+            )
+        logger.info(
+            "[%s] evidence collection complete impacts=%d symbol_facts=%d coverage_candidates=%d budget_used=%d/%d",
+            run_id,
+            len(impacts),
+            len(symbol_facts),
+            coverage.total_candidates,
+            budget.calls_used,
+            budget.max_total_tool_calls,
         )
 
         # --- Step 3: Build merge delta signals ---
@@ -390,6 +506,9 @@ class ReviewOrchestrator:
             changed_hunk_count=prepass.changed_hunk_count,
             seed_symbols=[s.symbol for s in prepass.seed_symbols],
             suspicious_anchors=prepass.suspicious_anchors,
+            changed_declarations=prepass.changed_declarations,
+            changed_containers=prepass.changed_containers,
+            member_call_sites=prepass.member_call_sites[:100],
             changed_methods=prepass.changed_methods,
             added_call_sites=prepass.added_call_sites,
             removed_call_sites=prepass.removed_call_sites,
@@ -406,6 +525,12 @@ class ReviewOrchestrator:
         # --- Step 5: Agent-driven follow-up exploration ---
         _check_deadline(deadline, "exploration")
         if budget.remaining_calls > 0 and budget.remaining_slots > 0:
+            logger.info(
+                "[%s] exploration follow-up start remaining_calls=%d remaining_slots=%d",
+                run_id,
+                budget.remaining_calls,
+                budget.remaining_slots,
+            )
             try:
                 followup = exploration.explore(
                     fact_sheet=fact_sheet,
@@ -438,16 +563,38 @@ class ReviewOrchestrator:
                     "evidence_anchors": existing_anchors[:500],
                     "warnings": sorted(set(warnings)),
                 })
+                logger.info(
+                    "[%s] exploration follow-up complete new_evidence=%d warnings=%d",
+                    run_id,
+                    len(followup.new_evidence),
+                    len(followup.warnings),
+                )
+        else:
+            logger.info(
+                "[%s] exploration follow-up skipped remaining_calls=%d remaining_slots=%d",
+                run_id,
+                budget.remaining_calls,
+                budget.remaining_slots,
+            )
 
         # --- Step 6: Test impact analysis ---
         _check_deadline(deadline, "test_impact")
+        logger.info("[%s] test impact analysis start", run_id)
         test_impact = _analyze_test_impact(
             prepass=prepass, impacts=impacts, client=client, views=views,
             budget=budget, tool_usage=tool_usage,
         )
+        logger.info(
+            "[%s] test impact analysis complete direct=%d likely=%d confidence=%.2f",
+            run_id,
+            len(test_impact.directly_impacted_tests),
+            len(test_impact.likely_impacted_tests),
+            test_impact.confidence,
+        )
 
         # --- Step 7: LLM Synthesis ---
         _check_deadline(deadline, "synthesis")
+        logger.info("[%s] synthesis step start", run_id)
         try:
             draft = synthesis.synthesize(
                 fact_sheet=fact_sheet,
@@ -498,6 +645,14 @@ class ReviewOrchestrator:
             workspace_id=bundle.workspace_id,
             run_id=run_id,
             run_metadata=run_metadata,
+        )
+        logger.info(
+            "[%s] review complete findings=%d blocking=%d status=%s confidence=%s",
+            run_id,
+            len(final.findings),
+            final.decision.blocking_findings,
+            final.decision.execution_status.value,
+            final.decision.review_confidence,
         )
         if cache is not None and cache_key:
             try:
@@ -635,8 +790,22 @@ class ReviewOrchestrator:
         tool_usage: list[ToolCallRecord],
         budget: BudgetTracker,
         deadline: float = 0.0,
+        *,
+        retrieval_stages: list[RetrievalStage] | None = None,
+        widening_events: list[dict[str, Any]] | None = None,
     ) -> tuple[list[SymbolImpact], list[SymbolFact], CoverageSummary]:
-        symbols = list(dict.fromkeys(plan.prioritized_symbols + [s.symbol for s in prepass.seed_symbols]))[: budget.max_symbols]
+        fallback_symbols = _fallback_prioritized_symbols(prepass, budget.max_symbols)
+        symbols = _normalize_investigation_symbols(
+            plan.prioritized_symbols + fallback_symbols,
+            prepass=prepass,
+            max_symbols=budget.max_symbols,
+        )
+        logger.info(
+            "evidence symbol queue prepared planned=%d fallback=%d final=%d",
+            len(plan.prioritized_symbols),
+            len(fallback_symbols),
+            len(symbols),
+        )
         impacts: list[SymbolImpact] = []
         facts: list[SymbolFact] = []
         for idx, symbol in enumerate(symbols):
@@ -644,7 +813,23 @@ class ReviewOrchestrator:
                 logger.debug("evidence collection stopped at symbol %d/%d (budget)", idx, len(symbols))
                 break
             _check_deadline(deadline, f"evidence_collection_symbol_{idx}")
-            impact = _collect_symbol(client, runtime, views.head, symbol, tool_usage, budget)
+            logger.info(
+                "evidence symbol start index=%d total=%d symbol=%s remaining_calls=%d",
+                idx + 1,
+                len(symbols),
+                symbol,
+                budget.remaining_calls,
+            )
+            impact = _collect_symbol(
+                client,
+                runtime,
+                views.head,
+                symbol,
+                tool_usage,
+                budget,
+                retrieval_stages=retrieval_stages or [],
+                widening_events=widening_events,
+            )
             impacts.append(impact)
             warnings = list(impact.warnings)
             if views.status.baseline_materialized and not budget.exhausted:
@@ -673,6 +858,16 @@ class ReviewOrchestrator:
                     warnings=sorted(set(warnings)),
                 )
             )
+            logger.info(
+                "evidence symbol complete index=%d total=%d symbol=%s candidates=%d refs=%d edges=%d warnings=%d",
+                idx + 1,
+                len(symbols),
+                symbol,
+                len(impact.candidate_file_keys),
+                len(impact.references),
+                len(impact.call_edges),
+                len(warnings),
+            )
         return impacts, facts, _coverage(impacts)
 
     @staticmethod
@@ -690,42 +885,75 @@ class ReviewOrchestrator:
 # Deterministic evidence collection (per-symbol)
 # ---------------------------------------------------------------------------
 
-def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: list[ToolCallRecord], budget: BudgetTracker) -> SymbolImpact:
-    # --- Phase 1: Candidate discovery ---
-    rg = _call(
-        tool_usage,
-        budget,
-        "collector",
-        "explore.rg_search",
-        client.explore_rg_search,
-        query=symbol,
-        mode="symbol",
-        analysis_context=analysis_context,
-        max_hits=min(budget.max_fetch_limit, 200),
-        max_files=min(budget.max_candidates_per_symbol, 200),
-        timeout_s=min(budget.parse_timeout_s, 60),
-        context_lines=1,
-    )
-    rg_hits = list(rg.get("hits", []) or [])
-    rg_candidates = [str(row.get("file_key", "")).strip() for row in rg_hits if str(row.get("file_key", "")).strip()]
+def _collect_symbol(
+    client,
+    runtime,
+    analysis_context,
+    symbol: str,
+    tool_usage: list[ToolCallRecord],
+    budget: BudgetTracker,
+    *,
+    retrieval_stages: list[RetrievalStage] | None = None,
+    widening_events: list[dict[str, Any]] | None = None,
+) -> SymbolImpact:
+    rg_hits: list[dict[str, Any]] = []
+    rg_candidates: list[str] = []
+    listed_candidates: list[str] = []
+    deleted: list[str] = []
+    discovery_warnings: list[str] = []
+    selected_stage_name = ""
+    stages = retrieval_stages or [RetrievalStage(name="repo_wide", entry_repos=[], max_repo_hops=0, path_prefixes=[])]
 
-    if budget.exhausted:
-        return _empty_impact(symbol, rg_hits=rg_hits)
+    for idx, stage in enumerate(stages):
+        logger.info(
+            "candidate discovery stage start symbol=%s stage=%s repos=%s prefixes=%s",
+            symbol,
+            stage.name,
+            stage.entry_repos,
+            stage.path_prefixes,
+        )
+        stage_rg, stage_listed, stage_deleted, stage_warnings = _discover_candidates_for_stage(
+            client=client,
+            analysis_context=analysis_context,
+            symbol=symbol,
+            tool_usage=tool_usage,
+            budget=budget,
+            stage=stage,
+        )
+        rg_hits = _merge_rg_hits(rg_hits, stage_rg)
+        rg_candidates = _dedupe_file_keys(rg_candidates + [str(row.get("file_key", "")).strip() for row in stage_rg if str(row.get("file_key", "")).strip()])
+        listed_candidates = _dedupe_file_keys(listed_candidates + stage_listed)
+        deleted = _dedupe_file_keys(deleted + stage_deleted)
+        discovery_warnings.extend(stage_warnings)
+        selected_stage_name = stage.name
 
-    listed = _call(
-        tool_usage,
-        budget,
-        "collector",
-        "explore.list_candidates",
-        client.explore_list_candidates,
-        symbol=symbol,
-        max_files=budget.max_candidates_per_symbol,
-        include_rg=True,
-        analysis_context=analysis_context,
-    )
-    listed_candidates = list(listed.get("candidates", []) or [])
+        candidate_count = len(_dedupe_file_keys(rg_candidates + listed_candidates))
+        logger.info(
+            "candidate discovery stage complete symbol=%s stage=%s rg_hits=%d listed=%d candidates=%d deleted=%d warnings=%d",
+            symbol,
+            stage.name,
+            len(stage_rg),
+            len(stage_listed),
+            candidate_count,
+            len(stage_deleted),
+            len(stage_warnings),
+        )
+        if idx > 0 and widening_events is not None:
+            widening_events.append(
+                {
+                    "symbol": symbol,
+                    "stage": stage.name,
+                    "candidate_count": candidate_count,
+                    "entry_repos": list(stage.entry_repos),
+                    "path_prefixes": list(stage.path_prefixes),
+                }
+            )
+        if budget.exhausted:
+            return _empty_impact(symbol, rg_hits=rg_hits)
+        if candidate_count >= 2 or (not stage.path_prefixes and stage.max_repo_hops == 0):
+            break
+
     candidates = _dedupe_file_keys(rg_candidates + listed_candidates)[: budget.max_candidates_per_symbol]
-    deleted = _dedupe_file_keys(list(listed.get("deleted_file_keys", []) or []))
 
     if budget.exhausted:
         return _empty_impact(symbol, rg_hits=rg_hits, candidates=candidates, deleted=deleted)
@@ -826,8 +1054,7 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
 
     warnings = sorted(
         set(
-            list(rg.get("warnings", []) or [])
-            + list(listed.get("warnings", []) or [])
+            discovery_warnings
             + list(freshness.get("warnings", []) or [])
             + list(parsed.get("parse_warnings", []) or [])
             + list(sym_rows.get("warnings", []) or [])
@@ -835,6 +1062,7 @@ def _collect_symbol(client, runtime, analysis_context, symbol: str, tool_usage: 
             + list(edge_rows.get("warnings", []) or [])
             + (["candidates_truncated"] if len(rg_candidates + listed_candidates) > len(candidates) else [])
             + (["macro_fallback_used"] if macro_summary else [])
+            + ([f"retrieval_scope:{selected_stage_name}"] if selected_stage_name else [])
             + (["budget_exhausted_mid_symbol"] if budget.exhausted else [])
         )
     )
@@ -887,6 +1115,313 @@ def _empty_impact(
     )
 
 
+def _discover_candidates_for_stage(
+    *,
+    client,
+    analysis_context,
+    symbol: str,
+    tool_usage: list[ToolCallRecord],
+    budget: BudgetTracker,
+    stage: RetrievalStage,
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
+    scope = {
+        "entry_repos": stage.entry_repos,
+        "max_repo_hops": stage.max_repo_hops,
+        "path_prefixes": stage.path_prefixes,
+    }
+    rg = _call(
+        tool_usage,
+        budget,
+        "collector",
+        "explore.rg_search",
+        client.explore_rg_search,
+        query=symbol,
+        mode="symbol",
+        analysis_context=analysis_context,
+        scope=scope,
+        max_hits=min(budget.max_fetch_limit, 200),
+        max_files=min(budget.max_candidates_per_symbol, 200),
+        timeout_s=min(budget.parse_timeout_s, 60),
+        context_lines=1,
+    )
+    rg_hits = list(rg.get("hits", []) or [])
+    if budget.exhausted:
+        return rg_hits, [], [], list(rg.get("warnings", []) or [])
+
+    listed = _call(
+        tool_usage,
+        budget,
+        "collector",
+        "explore.list_candidates",
+        client.explore_list_candidates,
+        symbol=symbol,
+        max_files=budget.max_candidates_per_symbol,
+        include_rg=True,
+        entry_repos=stage.entry_repos,
+        max_repo_hops=stage.max_repo_hops,
+        path_prefixes=stage.path_prefixes,
+        analysis_context=analysis_context,
+    )
+    stage_listed = list(listed.get("candidates", []) or [])
+    stage_deleted = list(listed.get("deleted_file_keys", []) or [])
+    warnings = list(rg.get("warnings", []) or []) + list(listed.get("warnings", []) or [])
+    return rg_hits, stage_listed, stage_deleted, warnings
+
+
+def _merge_rg_hits(existing: list[dict[str, Any]], new_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in existing + new_hits:
+        key = (str(row.get("file_key", "")), int(row.get("line", 0) or 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged[:200]
+
+
+def _normalize_bundle_and_scope_repos(
+    *,
+    workspace: dict[str, Any],
+    bundle,
+    changed_files: list[str],
+) -> tuple[Any, list[str], list[str]]:
+    """Resolve GitLab repo ids into manifest repo ids and derive changed repo scope."""
+    workspace_root = str(workspace.get("root_path", "") or "").strip()
+    manifest_path = str(workspace.get("manifest_path", "") or "").strip()
+    workspace_repos = {str(repo_id).strip() for repo_id in workspace.get("repos", []) if str(repo_id).strip()}
+    warnings: list[str] = []
+
+    if not workspace_root or not manifest_path:
+        entry_repos = [bundle.primary_repo_id] if bundle.primary_repo_id in workspace_repos else []
+        return bundle, entry_repos, warnings
+
+    try:
+        manifest = load_workspace_manifest(manifest_path)
+    except Exception as exc:
+        warnings.append(f"manifest_load_failed:{exc}")
+        entry_repos = [bundle.primary_repo_id] if bundle.primary_repo_id in workspace_repos else []
+        return bundle, entry_repos, warnings
+
+    normalized_primary_repo_id = resolve_repo_id_for_project_path(bundle.primary_repo_id, manifest) or bundle.primary_repo_id
+    normalized_repo_revisions: list[RepoRevisionContext] = []
+    for row in bundle.repo_revisions:
+        normalized_repo_id = resolve_repo_id_for_project_path(row.repo_id, manifest) or row.repo_id
+        normalized_repo_revisions.append(row.model_copy(update={"repo_id": normalized_repo_id}))
+
+    normalized_per_repo_shas: dict[str, str] = {}
+    for repo_id, sha in (bundle.per_repo_shas or {}).items():
+        normalized_repo_id = resolve_repo_id_for_project_path(repo_id, manifest) or repo_id
+        normalized_per_repo_shas[normalized_repo_id] = sha
+
+    changed_repo_ids: set[str] = set()
+    for path in changed_files:
+        file_key = resolve_file_key(changed_path=path, workspace_root=workspace_root, manifest=manifest)
+        if file_key:
+            changed_repo_ids.add(repo_for_file_key(file_key))
+    if not changed_repo_ids and normalized_primary_repo_id in manifest.repo_map():
+        changed_repo_ids.add(normalized_primary_repo_id)
+    elif not changed_repo_ids and bundle.primary_repo_id:
+        warnings.append(f"changed_repo_resolution_failed:{bundle.primary_repo_id}")
+
+    updated_bundle = bundle.model_copy(
+        update={
+            "primary_repo_id": normalized_primary_repo_id,
+            "repo_revisions": normalized_repo_revisions,
+            "per_repo_shas": normalized_per_repo_shas,
+        }
+    )
+    return updated_bundle, sorted(changed_repo_ids), warnings
+
+
+def _fallback_prioritized_symbols(prepass, max_symbols: int) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _append(values: list[str]) -> None:
+        for raw in values:
+            text = str(raw or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            ordered.append(text)
+            if len(ordered) >= max_symbols:
+                return
+
+    _append([decl.symbol for decl in prepass.changed_declarations])
+    _append(prepass.changed_containers)
+    _append([seed.symbol for seed in prepass.seed_symbols if seed.relevance_tier == "receiver_owned"])
+    _append([seed.symbol for seed in prepass.seed_symbols if seed.relevance_tier == "qualified"])
+    _append([
+        seed.symbol
+        for seed in prepass.seed_symbols
+        if any(reason.startswith("suspicious_anchor:") for reason in seed.reasons)
+    ])
+    _append([
+        seed.symbol
+        for seed in prepass.seed_symbols
+        if seed.relevance_tier == "generic_fallback"
+        and (
+            "changed_declaration:function" in seed.reasons
+            or "changed_declaration:method" in seed.reasons
+            or "changed_declaration:constructor" in seed.reasons
+            or "changed_declaration:destructor" in seed.reasons
+            or "qualified_occurrence" in seed.reasons
+        )
+    ])
+    return ordered[:max_symbols]
+
+
+def _normalize_investigation_symbols(symbols: list[str], *, prepass, max_symbols: int) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        symbol = _canonicalize_investigation_symbol(raw, prepass)
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        normalized.append(symbol)
+        if len(normalized) >= max_symbols:
+            break
+    return normalized
+
+
+def _canonicalize_investigation_symbol(symbol: str, prepass) -> str:
+    text = str(symbol or "").strip()
+    if not text:
+        return ""
+    known = {seed.symbol for seed in prepass.seed_symbols}
+    known.update(decl.symbol for decl in prepass.changed_declarations)
+    known.update(prepass.changed_containers)
+    if text in known:
+        return text
+    if "->" in text or "." in text:
+        for separator in ("->", "."):
+            if separator in text:
+                left = text.split(separator, 1)[0].strip()
+                right = text.split(separator, 1)[1].strip()
+                if left in prepass.changed_containers:
+                    return left
+                if left in known:
+                    return left
+                if right in known:
+                    return right
+                return left or right
+    return text
+
+
+def _build_retrieval_stages(
+    *,
+    workspace: dict[str, Any],
+    bundle,
+    prepass,
+    entry_repos: list[str],
+) -> list[RetrievalStage]:
+    stages: list[RetrievalStage] = []
+    repo_rel_paths = _resolve_repo_relative_changed_paths(
+        workspace=workspace,
+        changed_files=prepass.changed_files,
+        preferred_repos=entry_repos,
+    )
+    exact_prefixes = _derive_exact_prefixes(repo_rel_paths)
+    module_prefixes = _derive_module_prefixes(exact_prefixes)
+
+    if entry_repos and exact_prefixes:
+        stages.append(RetrievalStage(name="exact_paths", entry_repos=entry_repos, max_repo_hops=0, path_prefixes=exact_prefixes))
+    if entry_repos and module_prefixes and module_prefixes != exact_prefixes:
+        stages.append(RetrievalStage(name="module_paths", entry_repos=entry_repos, max_repo_hops=0, path_prefixes=module_prefixes))
+    if entry_repos:
+        stages.append(RetrievalStage(name="repo_wide", entry_repos=entry_repos, max_repo_hops=0, path_prefixes=[]))
+
+    if _is_interface_like_change(prepass):
+        stages.append(RetrievalStage(name="dependency_graph", entry_repos=entry_repos, max_repo_hops=1, path_prefixes=[]))
+
+    if not stages:
+        stages.append(RetrievalStage(name="repo_wide", entry_repos=entry_repos, max_repo_hops=0, path_prefixes=[]))
+    return stages
+
+
+def _resolve_repo_relative_changed_paths(
+    *,
+    workspace: dict[str, Any],
+    changed_files: list[str],
+    preferred_repos: list[str],
+) -> dict[str, list[str]]:
+    manifest_path = str(workspace.get("manifest_path", "") or "").strip()
+    workspace_root = str(workspace.get("root_path", "") or "").strip()
+    if not manifest_path or not workspace_root:
+        return {}
+    try:
+        manifest = load_workspace_manifest(manifest_path)
+    except Exception:
+        return {}
+
+    resolved: dict[str, list[str]] = defaultdict(list)
+    preferred = set(preferred_repos)
+    for path in changed_files:
+        file_key = resolve_file_key(changed_path=path, workspace_root=workspace_root, manifest=manifest)
+        if not file_key or ":" not in file_key:
+            continue
+        repo_id, rel_path = file_key.split(":", 1)
+        if preferred and repo_id not in preferred:
+            continue
+        if rel_path not in resolved[repo_id]:
+            resolved[repo_id].append(rel_path)
+    return resolved
+
+
+def _derive_exact_prefixes(repo_rel_paths: dict[str, list[str]]) -> list[str]:
+    prefixes: list[str] = []
+    for paths in repo_rel_paths.values():
+        for rel_path in paths:
+            parent = str(Path(rel_path).parent).replace("\\", "/").strip(".").strip("/")
+            if parent and parent not in prefixes:
+                prefixes.append(parent)
+    return prefixes[:8]
+
+
+def _derive_module_prefixes(exact_prefixes: list[str]) -> list[str]:
+    widened: list[str] = []
+    for prefix in exact_prefixes:
+        parts = [part for part in prefix.split("/") if part]
+        if len(parts) > 4:
+            candidate = "/".join(parts[:-1])
+        else:
+            candidate = prefix
+        if candidate and candidate not in widened:
+            widened.append(candidate)
+    common = _common_prefix_path(widened)
+    if common and len(common.split("/")) >= 4:
+        return [common]
+    return widened[:8]
+
+
+def _common_prefix_path(paths: list[str]) -> str:
+    if not paths:
+        return ""
+    split_paths = [[part for part in path.split("/") if part] for path in paths]
+    common: list[str] = []
+    for index in range(min(len(parts) for parts in split_paths)):
+        token = split_paths[0][index]
+        if all(parts[index] == token for parts in split_paths[1:]):
+            common.append(token)
+        else:
+            break
+    return "/".join(common)
+
+
+def _is_interface_like_change(prepass) -> bool:
+    if prepass.include_macro_config_changes:
+        return True
+    if any(path.endswith((".h", ".hh", ".hpp", ".hxx")) for path in prepass.changed_files):
+        return True
+    if any(decl.kind in {"class", "struct", "enum"} for decl in prepass.changed_declarations):
+        return True
+    if any(anchor.kind == "abi_or_dispatch" for anchor in prepass.suspicious_anchors):
+        return True
+    return False
+
+
 def _fetch_counts(client, runtime, analysis_context, symbol: str, impact: SymbolImpact, tool_usage: list[ToolCallRecord], budget: BudgetTracker) -> tuple[int, int]:
     if budget.exhausted:
         return 0, 0
@@ -915,13 +1450,21 @@ def _call(tool_usage: list[ToolCallRecord], budget: BudgetTracker, skill: str, t
     if not budget.consume_call():
         return {"warnings": [f"max_total_tool_calls_reached:{budget.max_total_tool_calls}"]}
     t0 = perf_counter()
+    logger.debug("tool call start tool=%s remaining_calls=%d", tool, budget.remaining_calls)
     try:
         data = fn(**kwargs)
-        tool_usage.append(ToolCallRecord(skill=skill, tool=tool, success=True, elapsed_ms=(perf_counter() - t0) * 1000.0))
+        elapsed_ms = (perf_counter() - t0) * 1000.0
+        tool_usage.append(ToolCallRecord(skill=skill, tool=tool, success=True, elapsed_ms=elapsed_ms))
+        if elapsed_ms >= 1000.0:
+            logger.info("tool call complete tool=%s elapsed_ms=%.1f success=true", tool, elapsed_ms)
+        else:
+            logger.debug("tool call complete tool=%s elapsed_ms=%.1f success=true", tool, elapsed_ms)
         return data if isinstance(data, dict) else {}
     except Exception as exc:
         logger.debug("tool call %s failed: %s", tool, exc)
-        tool_usage.append(ToolCallRecord(skill=skill, tool=tool, success=False, elapsed_ms=(perf_counter() - t0) * 1000.0, note=str(exc)))
+        elapsed_ms = (perf_counter() - t0) * 1000.0
+        logger.info("tool call complete tool=%s elapsed_ms=%.1f success=false error=%s", tool, elapsed_ms, exc)
+        tool_usage.append(ToolCallRecord(skill=skill, tool=tool, success=False, elapsed_ms=elapsed_ms, note=str(exc)))
         return {"warnings": [f"{tool}_failed:{exc}"]}
 
 
@@ -1076,7 +1619,11 @@ def _analyze_test_impact(
 
     # 3. Semantic test dependency: for top changed methods, fetch references to find test files
     semantic_test_files: set[str] = set()
-    methods_to_check = prepass.changed_methods[:10]
+    methods_to_check = prepass.changed_methods[:10] or [
+        decl.symbol
+        for decl in prepass.changed_declarations
+        if decl.kind in {"function", "method", "constructor", "destructor"}
+    ][:10]
     for method in methods_to_check:
         if budget.exhausted:
             break
