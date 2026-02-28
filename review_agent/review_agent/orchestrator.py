@@ -9,23 +9,31 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 from time import perf_counter, sleep
+from uuid import uuid4
 
 from review_agent.context_ingestion import IngestedReviewContext, ReviewContextIngestor
 from review_agent.models import (
+    AGENT_VERSION,
     CoverageSummary,
     EvidenceRef,
     FindingCategory,
+    InfrastructureError,
+    InputNormalizationError,
+    PARSER_VERSION,
+    PROMPT_VERSION,
     ReviewDecision,
+    ReviewExecutionStatus,
     ReviewFactSheet,
     ReviewFinding,
     ReviewPlan,
     ReviewReport,
     ReviewRequest,
+    ReviewTestImpact,
+    RunMetadata,
     SEVERITY_RANK,
     Severity,
     SymbolFact,
     SymbolImpact,
-    TestImpact,
     ToolCallRecord,
     ViewContextMaterialization,
 )
@@ -323,6 +331,7 @@ class ReviewOrchestrator:
         self._synthesis_cache: dict[str, Any] = {}
 
     def run(self, request: ReviewRequest) -> ReviewReport:
+        run_id = uuid4().hex[:12]
         owns_client = self._client is None
         client = self._client or CxxtractHttpClient(
             base_url=request.cxxtract_base_url,
@@ -338,30 +347,64 @@ class ReviewOrchestrator:
         # Context IDs created during this run, for cleanup
         created_context_ids: list[str] = []
 
+        # Determine infra fail behaviour
+        infra_should_block = request.infra_fail_mode != "pass"
+
         try:
-            return self._run_inner(request, client, deadline, created_context_ids)
+            return self._run_inner(request, client, deadline, created_context_ids, run_id)
         except _ReviewTimeout:
-            logger.warning("review timed out after %ds", request.review_timeout_s)
-            return ReviewReport(
+            logger.warning("[%s] review timed out after %ds", run_id, request.review_timeout_s)
+            return _indeterminate_report(
                 workspace_id=request.workspace_id,
+                reason=f"review_wall_clock_timeout_after_{request.review_timeout_s}s",
                 summary=f"Review timed out after {request.review_timeout_s}s; partial results.",
-                findings=[],
-                coverage=CoverageSummary(),
-                decision=ReviewDecision(
-                    fail_threshold=request.fail_on_severity,
-                    blocking_findings=0,
-                    should_block=False,
+                fail_threshold=request.fail_on_severity,
+                should_block=infra_should_block,
+                run_id=run_id,
+                run_metadata=RunMetadata(
+                    input_mode="unknown",
+                    run_id=run_id,
+                    backend_base_url=request.cxxtract_base_url,
                 ),
-                tool_usage=[],
+            )
+        except InputNormalizationError as exc:
+            logger.error("[%s] input normalization failed: %s", run_id, exc)
+            return _indeterminate_report(
+                workspace_id=request.workspace_id,
+                reason=f"input_normalization_error:{exc}",
+                summary=f"Input normalization failed: {exc}",
+                fail_threshold=request.fail_on_severity,
+                should_block=infra_should_block,
+                run_id=run_id,
+                run_metadata=RunMetadata(
+                    input_mode="unknown",
+                    run_id=run_id,
+                    backend_base_url=request.cxxtract_base_url,
+                ),
+            )
+        except InfrastructureError as exc:
+            logger.error("[%s] infrastructure error: %s", run_id, exc)
+            return _indeterminate_report(
+                workspace_id=request.workspace_id,
+                reason=f"infrastructure_error:{exc}",
+                summary=f"Infrastructure error: {exc}",
+                fail_threshold=request.fail_on_severity,
+                should_block=infra_should_block,
+                run_id=run_id,
+                run_metadata=RunMetadata(
+                    input_mode="unknown",
+                    run_id=run_id,
+                    backend_base_url=request.cxxtract_base_url,
+                ),
             )
         finally:
             # Expire any contexts we created
             for ctx_id in created_context_ids:
                 try:
                     client.context_expire(context_id=ctx_id)
-                    logger.debug("expired context %s", ctx_id)
+                    logger.debug("[%s] expired context %s", run_id, ctx_id)
                 except Exception as exc:
-                    logger.debug("failed to expire context %s: %s", ctx_id, exc)
+                    logger.debug("[%s] failed to expire context %s: %s", run_id, ctx_id, exc)
             # Close the HTTP client if we own it
             if owns_client:
                 client.close()
@@ -372,22 +415,41 @@ class ReviewOrchestrator:
         client: CxxtractHttpClient,
         deadline: float,
         created_context_ids: list[str],
+        run_id: str,
     ) -> ReviewReport:
+        # Determine input mode for metadata
+        input_mode = _detect_input_mode(request)
+
+        run_metadata = RunMetadata(
+            input_mode=input_mode,
+            run_id=run_id,
+            backend_base_url=request.cxxtract_base_url,
+        )
+
         # Health check
         try:
             workspace = client.workspace_info()
         except Exception as exc:
-            raise RuntimeError(
+            raise InfrastructureError(
                 f"CXXtract backend unreachable at {client.base_url}; is the service running? ({exc})"
             ) from exc
 
         ws_id = str(workspace.get("workspace_id", "")).strip() or request.workspace_id
         if ws_id != request.workspace_id:
-            raise RuntimeError("workspace info mismatch for requested workspace_id")
+            raise InfrastructureError("workspace info mismatch for requested workspace_id")
 
         runtime = ReviewContextIngestor.ingest(request)
         bundle = runtime.bundle
         changes = parse_unified_diff(bundle.patch_text)
+
+        # Fail-fast invariant: non-empty patch input must produce ≥1 PatchChange
+        if bundle.patch_text.strip() and not changes:
+            raise InputNormalizationError(
+                f"patch input contained {len(bundle.patch_text)} bytes but "
+                f"parse_unified_diff produced 0 changes; the diff format may "
+                f"be incompatible (missing 'diff --git' headers?)"
+            )
+
         prepass = build_prepass_result(changes, max_symbols=runtime.max_symbols)
         if not bundle.changed_files:
             bundle.changed_files = list(prepass.changed_files)
@@ -406,22 +468,7 @@ class ReviewOrchestrator:
 
         _check_deadline(deadline, "context_ingestion")
 
-        views = self._prepare_views(
-            client=client, runtime_context=bundle,
-            lock_root=runtime.cache_dir, created_context_ids=created_context_ids,
-        )
-        tool_usage: list[ToolCallRecord] = []
-
-        budget = BudgetTracker(
-            max_symbol_slots=runtime.max_symbol_slots,
-            max_total_tool_calls=runtime.max_total_tool_calls,
-            max_symbols=runtime.max_symbols,
-            max_candidates_per_symbol=runtime.max_candidates_per_symbol,
-            max_fetch_limit=runtime.max_fetch_limit,
-            parse_timeout_s=runtime.parse_timeout_s,
-            parse_workers=runtime.parse_workers,
-        )
-
+        # --- Cache lookup BEFORE view materialization ---
         cache = ReviewTraceCache(runtime.cache_dir) if runtime.enable_cache else None
         cache_key = ""
         if cache is not None:
@@ -442,12 +489,36 @@ class ReviewOrchestrator:
                     "parse_workers": runtime.parse_workers,
                     "max_candidates_per_symbol": runtime.max_candidates_per_symbol,
                     "max_fetch_limit": runtime.max_fetch_limit,
+                    "agent_version": AGENT_VERSION,
+                    "prompt_version": PROMPT_VERSION,
+                    "parser_version": PARSER_VERSION,
                 },
             )
-            cached = cache.load_report(cache_key)
+            try:
+                cached = cache.load_report(cache_key)
+            except Exception as exc:
+                logger.warning("[%s] cache load failed, treating as miss: %s", run_id, exc)
+                cached = None
             if cached is not None:
-                logger.info("cache hit for key %s", cache_key[:16])
+                logger.info("[%s] cache hit for key %s", run_id, cache_key[:16])
                 return cached
+
+        # --- View materialization (only on cache miss) ---
+        views = self._prepare_views(
+            client=client, runtime_context=bundle,
+            lock_root=runtime.cache_dir, created_context_ids=created_context_ids,
+        )
+        tool_usage: list[ToolCallRecord] = []
+
+        budget = BudgetTracker(
+            max_symbol_slots=runtime.max_symbol_slots,
+            max_total_tool_calls=runtime.max_total_tool_calls,
+            max_symbols=runtime.max_symbols,
+            max_candidates_per_symbol=runtime.max_candidates_per_symbol,
+            max_fetch_limit=runtime.max_fetch_limit,
+            parse_timeout_s=runtime.parse_timeout_s,
+            parse_workers=runtime.parse_workers,
+        )
 
         # --- Step 1: LLM Planner ---
         _check_deadline(deadline, "planner")
@@ -468,7 +539,7 @@ class ReviewOrchestrator:
         try:
             plan = planner.run_sync(planner_prompt).data
         except Exception as exc:
-            logger.warning("planner failed, using seed-symbol fallback: %s", exc)
+            logger.warning("[%s] planner failed, using seed-symbol fallback: %s", run_id, exc)
             plan = ReviewPlan(prioritized_symbols=[s.symbol for s in prepass.seed_symbols[: runtime.max_symbols]])
 
         # --- Step 2: Deterministic base evidence collection ---
@@ -479,6 +550,9 @@ class ReviewOrchestrator:
 
         # --- Step 3: Build merge delta signals ---
         merge_delta_signals = _build_merge_delta_signals(symbol_facts, views)
+
+        # Determine if merge analysis is degraded
+        merge_analysis_degraded = _is_merge_degraded(bundle, views)
 
         # --- Step 4: Build initial fact sheet ---
         fact_sheet = ReviewFactSheet(
@@ -495,6 +569,7 @@ class ReviewOrchestrator:
             coverage=coverage,
             view_contexts=views.status,
             merge_delta_signals=merge_delta_signals,
+            merge_analysis_degraded=merge_analysis_degraded,
             warnings=sorted(set(prepass.warnings + views.status.warnings + coverage.warnings)),
         )
 
@@ -534,7 +609,7 @@ class ReviewOrchestrator:
                 build_synthesis_prompt(fact_sheet=fact_sheet, fail_threshold=runtime.fail_on_severity.value)
             ).data
         except Exception as exc:
-            logger.warning("synthesis failed, using deterministic fallback: %s", exc)
+            logger.warning("[%s] synthesis failed, using deterministic fallback: %s", run_id, exc)
             draft = ReviewReport(
                 workspace_id=bundle.workspace_id,
                 summary="LLM synthesis failed; using deterministic fallback.",
@@ -544,6 +619,8 @@ class ReviewOrchestrator:
                     fail_threshold=runtime.fail_on_severity,
                     blocking_findings=0,
                     should_block=False,
+                    execution_status=ReviewExecutionStatus.INDETERMINATE,
+                    indeterminate_reason="synthesis_failed",
                 ),
                 tool_usage=tool_usage,
             )
@@ -556,9 +633,15 @@ class ReviewOrchestrator:
             fail_threshold=runtime.fail_on_severity,
             tool_usage=tool_usage,
             workspace_id=bundle.workspace_id,
+            run_id=run_id,
+            run_metadata=run_metadata,
+            infra_fail_mode=request.infra_fail_mode,
         )
         if cache is not None and cache_key:
-            cache.save(cache_key, {"review_report": final.model_dump(mode="json")})
+            try:
+                cache.save(cache_key, {"review_report": final.model_dump(mode="json")})
+            except Exception as exc:
+                logger.warning("[%s] failed to persist cache: %s", run_id, exc)
         return final
 
     def _planner_for(self, model_name: str):
@@ -1113,6 +1196,21 @@ def _build_merge_delta_signals(symbol_facts: list[SymbolFact], views: ViewContex
 
 
 # ---------------------------------------------------------------------------
+# Merge degradation check
+# ---------------------------------------------------------------------------
+
+def _is_merge_degraded(bundle, views: ViewContexts) -> bool:
+    """Returns True when merge-aware analysis is unreliable."""
+    if not bundle.merge_preview_sha:
+        return False  # no merge requested, not degraded
+    if not views.status.merge_preview_materialized:
+        return True
+    if not bundle.primary_repo_id and not bundle.per_repo_shas:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Test impact analysis
 # ---------------------------------------------------------------------------
 
@@ -1124,7 +1222,7 @@ def _analyze_test_impact(
     views: ViewContexts,
     budget: BudgetTracker,
     tool_usage: list[ToolCallRecord],
-) -> TestImpact:
+) -> ReviewTestImpact:
     """Build test impact using path heuristics + call-edge traversal + semantic lookup."""
     # 1. Directly impacted: changed files that are tests
     direct = sorted({p for p in prepass.changed_files if _looks_like_test_path(p)})
@@ -1203,7 +1301,7 @@ def _analyze_test_impact(
     if dependency_edges:
         rationale.append(f"call_edge_trace:{len(dependency_edges)}_edges")
 
-    return TestImpact(
+    return ReviewTestImpact(
         directly_impacted_tests=direct[:200],
         likely_impacted_tests=sorted([p for p in likely if p not in set(direct)])[:300],
         suggested_scopes=list(dict.fromkeys(scopes)),
@@ -1217,7 +1315,18 @@ def _analyze_test_impact(
 # Policy gate
 # ---------------------------------------------------------------------------
 
-def _policy_gate(*, report: ReviewReport, fact_sheet: ReviewFactSheet, test_impact: TestImpact, fail_threshold: Severity, tool_usage: list[ToolCallRecord], workspace_id: str) -> ReviewReport:
+def _policy_gate(
+    *,
+    report: ReviewReport,
+    fact_sheet: ReviewFactSheet,
+    test_impact: ReviewTestImpact,
+    fail_threshold: Severity,
+    tool_usage: list[ToolCallRecord],
+    workspace_id: str,
+    run_id: str = "",
+    run_metadata: RunMetadata | None = None,
+    infra_fail_mode: str = "block",
+) -> ReviewReport:
     findings: list[ReviewFinding] = []
     for finding in report.findings:
         if finding.severity in {Severity.HIGH, Severity.CRITICAL} and not finding.evidence:
@@ -1238,11 +1347,95 @@ def _policy_gate(*, report: ReviewReport, fact_sheet: ReviewFactSheet, test_impa
                 tags=["coverage_policy"],
             )
         )
+
+    # Add merge degradation finding if applicable
+    if fact_sheet.merge_analysis_degraded:
+        findings.append(
+            ReviewFinding(
+                id=_fid("merge_degraded", workspace_id),
+                severity=Severity.MEDIUM,
+                category=FindingCategory.CONFIDENCE_GAP,
+                title="Merge-aware analysis is degraded",
+                impact="Merge-preview comparison may be unreliable; merge-specific findings disabled.",
+                recommendation="Provide primary_repo_id and per_repo_shas for accurate merge analysis.",
+                evidence=[EvidenceRef(tool="policy_gate", description="merge_analysis_degraded")],
+                confidence=0.95,
+                tags=["merge_degraded"],
+            )
+        )
+
     findings = sorted(findings, key=lambda f: (-SEVERITY_RANK[f.severity], f.title, f.id))
     blocking = len([f for f in findings if SEVERITY_RANK[f.severity] >= SEVERITY_RANK[fail_threshold]])
-    should_block = blocking > 0 and not (low_cov and not any(f.severity == Severity.CRITICAL and f.evidence for f in findings))
+
+    # Determine execution status
+    exec_status = ReviewExecutionStatus.PASS
+    indet_reason = ""
+    if low_cov and not any(f.severity == Severity.CRITICAL and f.evidence for f in findings):
+        exec_status = ReviewExecutionStatus.INDETERMINATE
+        indet_reason = "low_coverage_no_evidenced_critical"
+        # With indeterminate, blocking depends on infra_fail_mode
+        should_block = blocking > 0 and infra_fail_mode != "pass"
+    elif blocking > 0:
+        exec_status = ReviewExecutionStatus.BLOCK
+        should_block = True
+    else:
+        should_block = False
+
     summary = report.summary.strip() or f"Reviewed {len(fact_sheet.changed_files)} files; findings={len(findings)}."
-    return report.model_copy(update={"workspace_id": workspace_id, "summary": summary, "findings": findings, "coverage": fact_sheet.coverage, "decision": ReviewDecision(fail_threshold=fail_threshold, blocking_findings=blocking, should_block=should_block), "tool_usage": tool_usage, "fact_sheet": fact_sheet, "test_impact": test_impact})
+
+    decision = ReviewDecision(
+        fail_threshold=fail_threshold,
+        blocking_findings=blocking,
+        should_block=should_block,
+        execution_status=exec_status,
+        indeterminate_reason=indet_reason,
+    )
+
+    return report.model_copy(update={
+        "workspace_id": workspace_id,
+        "summary": summary,
+        "findings": findings,
+        "coverage": fact_sheet.coverage,
+        "decision": decision,
+        "tool_usage": tool_usage,
+        "fact_sheet": fact_sheet,
+        "test_impact": test_impact,
+        "run_metadata": run_metadata,
+        "run_id": run_id,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Indeterminate report builder
+# ---------------------------------------------------------------------------
+
+def _indeterminate_report(
+    *,
+    workspace_id: str,
+    reason: str,
+    summary: str,
+    fail_threshold: Severity,
+    should_block: bool,
+    run_id: str = "",
+    run_metadata: RunMetadata | None = None,
+) -> ReviewReport:
+    """Build a report with INDETERMINATE execution status."""
+    return ReviewReport(
+        workspace_id=workspace_id,
+        summary=summary,
+        findings=[],
+        coverage=CoverageSummary(),
+        decision=ReviewDecision(
+            fail_threshold=fail_threshold,
+            blocking_findings=0,
+            should_block=should_block,
+            execution_status=ReviewExecutionStatus.INDETERMINATE,
+            indeterminate_reason=reason,
+        ),
+        tool_usage=[],
+        run_id=run_id,
+        run_metadata=run_metadata,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1251,6 +1444,16 @@ def _policy_gate(*, report: ReviewReport, fact_sheet: ReviewFactSheet, test_impa
 
 def _fid(*parts: str) -> str:
     return sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def _detect_input_mode(request: ReviewRequest) -> str:
+    """Detect the input mode from the request shape."""
+    if request.context_bundle is not None:
+        meta = request.context_bundle.pr_metadata or {}
+        if meta.get("web_url", ""):
+            return "gitlab_mr"
+        return "context_bundle"
+    return "patch_file"
 
 
 def _looks_like_test_path(path: str) -> bool:

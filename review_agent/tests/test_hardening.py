@@ -1,5 +1,6 @@
 """Tests for hardening fixes: budget exhaustion, cache keys, merge deltas,
-test impact, renderer, view failures, and stale lock cleanup."""
+test impact, renderer, view failures, stale lock cleanup, three-state
+execution model, GitLab diff normalization, and cache correctness."""
 
 from __future__ import annotations
 
@@ -14,13 +15,18 @@ from review_agent.models import (
     CoverageSummary,
     EvidenceRef,
     FindingCategory,
+    InputNormalizationError,
+    InfrastructureError,
     ReviewContextBundle,
     ReviewDecision,
+    ReviewExecutionStatus,
     ReviewFactSheet,
     ReviewFinding,
     ReviewPlan,
     ReviewReport,
     ReviewRequest,
+    ReviewTestImpact,
+    RunMetadata,
     Severity,
     SymbolFact,
     SymbolImpact,
@@ -39,6 +45,8 @@ from review_agent.orchestrator import (
     _pid_alive,
     _analyze_test_impact,
     _empty_impact,
+    _is_merge_degraded,
+    _indeterminate_report,
 )
 from review_agent.report_renderer import render_markdown
 
@@ -301,7 +309,7 @@ class TestTestImpactAnalysis:
             client=_TestImpactClient(), views=views,
             budget=budget, tool_usage=tool_usage,
         )
-        assert isinstance(result, TestImpact)
+        assert isinstance(result, ReviewTestImpact)
         assert "tests/test_bar.cpp" in result.directly_impacted_tests
         assert "tests/test_integration.cpp" in result.likely_impacted_tests
         # Semantic lookup should have found test_foo.cpp
@@ -350,7 +358,7 @@ class TestReportRenderer:
                 }],
             )
         if with_test_impact:
-            report.test_impact = TestImpact(
+            report.test_impact = ReviewTestImpact(
                 directly_impacted_tests=["tests/test_a.cpp"],
                 likely_impacted_tests=["tests/test_b.cpp"],
                 suggested_scopes=["smoke", "unit"],
@@ -405,6 +413,45 @@ class TestReportRenderer:
         assert "[HIGH]" in md
         assert "Missing null check" in md
         assert "a.cpp:10" in md
+
+    def test_indeterminate_status_rendered(self):
+        report = self._report()
+        report.decision = ReviewDecision(
+            fail_threshold=Severity.HIGH,
+            blocking_findings=0,
+            should_block=False,
+            execution_status=ReviewExecutionStatus.INDETERMINATE,
+            indeterminate_reason="timeout_exceeded",
+        )
+        md = render_markdown(report)
+        assert "INDETERMINATE" in md
+        assert "timeout_exceeded" in md
+
+    def test_run_metadata_rendered(self):
+        report = self._report()
+        report.run_metadata = RunMetadata(input_mode="gitlab_mr")
+        report.run_id = "abc123"
+        md = render_markdown(report)
+        assert "abc123" in md
+        assert "gitlab_mr" in md
+
+    def test_merge_degraded_rendered(self):
+        report = self._report(with_fact_sheet=True)
+        report.fact_sheet.merge_analysis_degraded = True
+        md = render_markdown(report)
+        assert "degraded" in md
+
+    def test_diff_position_rendered(self):
+        report = self._report()
+        report.findings = [
+            ReviewFinding(
+                id="f2", severity=Severity.MEDIUM, category=FindingCategory.ARCHITECTURE_RISK,
+                title="Unused param", impact="Dead code", recommendation="Remove",
+                diff_path="src/engine.cpp", diff_line=42,
+            ),
+        ]
+        md = render_markdown(report)
+        assert "src/engine.cpp:42" in md
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +591,7 @@ class TestContextExpiry:
 
 
 # ---------------------------------------------------------------------------
-# Health check
+# Health check -- now returns indeterminate report instead of raising
 # ---------------------------------------------------------------------------
 
 class _UnreachableClient(_NullClient):
@@ -553,7 +600,8 @@ class _UnreachableClient(_NullClient):
 
 
 class TestHealthCheck:
-    def test_unreachable_backend_gives_clear_error(self):
+    def test_unreachable_backend_gives_indeterminate_report(self):
+        """Backend unreachable should produce an INDETERMINATE report."""
         orchestrator = ReviewOrchestrator(
             client=_UnreachableClient(),
             planner_factory=lambda m: _FakePlanner(),
@@ -564,5 +612,451 @@ class TestHealthCheck:
             patch_text="diff --git a/a b/a\n",
             enable_cache=False,
         )
-        with pytest.raises(RuntimeError, match="CXXtract backend unreachable"):
-            orchestrator.run(req)
+        report = orchestrator.run(req)
+        assert report.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert "infrastructure_error" in report.decision.indeterminate_reason
+        # Default infra_fail_mode is "block", so should_block=True
+        assert report.decision.should_block is True
+
+    def test_unreachable_backend_pass_mode(self):
+        """With infra_fail_mode='pass', unreachable backend should not block."""
+        orchestrator = ReviewOrchestrator(
+            client=_UnreachableClient(),
+            planner_factory=lambda m: _FakePlanner(),
+            synthesis_factory=lambda m: _FakeSynth(),
+        )
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            enable_cache=False,
+            infra_fail_mode="pass",
+        )
+        report = orchestrator.run(req)
+        assert report.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert report.decision.should_block is False
+
+
+# ---------------------------------------------------------------------------
+# Three-state execution model
+# ---------------------------------------------------------------------------
+
+class TestExecutionStatus:
+    def test_indeterminate_report_has_correct_shape(self):
+        report = _indeterminate_report(
+            workspace_id="ws",
+            reason="test_reason",
+            summary="Testing indeterminate",
+            fail_threshold=Severity.HIGH,
+            should_block=True,
+            run_id="r123",
+        )
+        assert report.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert report.decision.indeterminate_reason == "test_reason"
+        assert report.decision.should_block is True
+        assert report.run_id == "r123"
+        assert report.findings == []
+
+    def test_execution_status_default_is_pass(self):
+        decision = ReviewDecision(
+            fail_threshold=Severity.HIGH,
+            blocking_findings=0,
+            should_block=False,
+        )
+        assert decision.execution_status == ReviewExecutionStatus.PASS
+        assert decision.indeterminate_reason == ""
+
+    def test_run_metadata_in_report(self):
+        report = ReviewReport(
+            workspace_id="ws",
+            summary="test",
+            decision=ReviewDecision(fail_threshold=Severity.HIGH, blocking_findings=0, should_block=False),
+            run_metadata=RunMetadata(input_mode="gitlab_mr", run_id="r123"),
+            run_id="r123",
+        )
+        assert report.run_metadata is not None
+        assert report.run_metadata.input_mode == "gitlab_mr"
+        assert report.run_id == "r123"
+
+
+# ---------------------------------------------------------------------------
+# Input normalization error
+# ---------------------------------------------------------------------------
+
+class TestInputNormalization:
+    def test_empty_parse_from_bad_format_raises(self):
+        """Patch text that produces 0 changes should cause InputNormalizationError
+        and result in an INDETERMINATE report."""
+        orchestrator = ReviewOrchestrator(
+            client=_NullClient(),
+            planner_factory=lambda m: _FakePlanner(),
+            synthesis_factory=lambda m: _FakeSynth(),
+        )
+        # This patch text has no 'diff --git' header, so parse_unified_diff returns []
+        bad_patch = "--- a/file.cpp\n+++ b/file.cpp\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text=bad_patch,
+            enable_cache=False,
+        )
+        report = orchestrator.run(req)
+        assert report.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert "input_normalization_error" in report.decision.indeterminate_reason
+
+    def test_valid_patch_passes_normalization(self):
+        """A valid patch with diff --git headers should parse successfully."""
+        orchestrator = ReviewOrchestrator(
+            client=_NullClient(),
+            planner_factory=lambda m: _FakePlanner(),
+            synthesis_factory=lambda m: _FakeSynth(),
+        )
+        good_patch = "diff --git a/file.cpp b/file.cpp\n--- a/file.cpp\n+++ b/file.cpp\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text=good_patch,
+            enable_cache=False,
+        )
+        report = orchestrator.run(req)
+        # Should not be indeterminate from normalization
+        assert report.decision.execution_status != ReviewExecutionStatus.INDETERMINATE or \
+            "input_normalization" not in (report.decision.indeterminate_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# Merge degradation detection
+# ---------------------------------------------------------------------------
+
+class TestMergeDegradation:
+    def test_not_degraded_when_no_merge_requested(self):
+        bundle = ReviewContextBundle(workspace_id="ws", patch_text="diff")
+        views = ViewContexts(
+            baseline={}, head={}, merge_preview=None,
+            status=ViewContextMaterialization(),
+        )
+        assert _is_merge_degraded(bundle, views) is False
+
+    def test_degraded_when_merge_sha_but_not_materialized(self):
+        bundle = ReviewContextBundle(
+            workspace_id="ws", patch_text="diff",
+            merge_preview_sha="a" * 40,
+        )
+        views = ViewContexts(
+            baseline={}, head={}, merge_preview=None,
+            status=ViewContextMaterialization(merge_preview_materialized=False),
+        )
+        assert _is_merge_degraded(bundle, views) is True
+
+    def test_degraded_when_no_repo_identity(self):
+        bundle = ReviewContextBundle(
+            workspace_id="ws", patch_text="diff",
+            merge_preview_sha="a" * 40,
+        )
+        views = ViewContexts(
+            baseline={}, head={},
+            merge_preview={"mode": "pr"},
+            status=ViewContextMaterialization(merge_preview_materialized=True),
+        )
+        assert _is_merge_degraded(bundle, views) is True
+
+    def test_not_degraded_when_fully_materialized(self):
+        bundle = ReviewContextBundle(
+            workspace_id="ws", patch_text="diff",
+            merge_preview_sha="a" * 40,
+            primary_repo_id="repoA",
+            per_repo_shas={"repoA": "b" * 40},
+        )
+        views = ViewContexts(
+            baseline={}, head={},
+            merge_preview={"mode": "pr"},
+            status=ViewContextMaterialization(merge_preview_materialized=True),
+        )
+        assert _is_merge_degraded(bundle, views) is False
+
+
+# ---------------------------------------------------------------------------
+# GitLab diff normalization
+# ---------------------------------------------------------------------------
+
+class TestGitLabDiffNormalization:
+    def test_modified_file_produces_valid_patch(self):
+        from review_agent.tool_clients.gitlab_client import GitLabClient
+        from review_agent.patch_parser import parse_unified_diff
+
+        # Simulate what GitLab returns for a modified file
+        gl_changes = {
+            "changes": [
+                {
+                    "old_path": "src/engine.cpp",
+                    "new_path": "src/engine.cpp",
+                    "diff": "@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n context\n",
+                    "new_file": False,
+                    "deleted_file": False,
+                    "renamed_file": False,
+                },
+            ]
+        }
+
+        # Use the diff reconstruction logic directly
+        changes = gl_changes["changes"]
+        parts: list[str] = []
+        for ch in changes:
+            diff_body = str(ch.get("diff", "") or "")
+            old_path = str(ch.get("old_path", "") or "")
+            new_path = str(ch.get("new_path", "") or "")
+            lines = [f"diff --git a/{old_path} b/{new_path}"]
+            lines.append(f"--- a/{old_path}")
+            lines.append(f"+++ b/{new_path}")
+            if diff_body:
+                lines.append(diff_body.lstrip("\n"))
+            parts.append("\n".join(lines))
+        patch_text = "\n".join(parts)
+
+        parsed = parse_unified_diff(patch_text)
+        assert len(parsed) == 1
+        assert parsed[0].old_path == "src/engine.cpp"
+        assert parsed[0].new_path == "src/engine.cpp"
+        assert len(parsed[0].hunks) == 1
+
+    def test_added_file_produces_valid_patch(self):
+        from review_agent.patch_parser import parse_unified_diff
+
+        patch_text = (
+            "diff --git a/new_file.cpp b/new_file.cpp\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/new_file.cpp\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+line 1\n"
+            "+line 2\n"
+            "+line 3\n"
+        )
+        parsed = parse_unified_diff(patch_text)
+        assert len(parsed) == 1
+        assert parsed[0].change_type.value == "added"
+
+    def test_deleted_file_produces_valid_patch(self):
+        from review_agent.patch_parser import parse_unified_diff
+
+        patch_text = (
+            "diff --git a/old_file.cpp b/old_file.cpp\n"
+            "deleted file mode 100644\n"
+            "--- a/old_file.cpp\n"
+            "+++ /dev/null\n"
+            "@@ -1,3 +0,0 @@\n"
+            "-line 1\n"
+            "-line 2\n"
+            "-line 3\n"
+        )
+        parsed = parse_unified_diff(patch_text)
+        assert len(parsed) == 1
+        assert parsed[0].change_type.value == "deleted"
+
+    def test_renamed_file_produces_valid_patch(self):
+        from review_agent.patch_parser import parse_unified_diff
+
+        patch_text = (
+            "diff --git a/old_name.cpp b/new_name.cpp\n"
+            "rename from old_name.cpp\n"
+            "rename to new_name.cpp\n"
+            "--- a/old_name.cpp\n"
+            "+++ b/new_name.cpp\n"
+            "@@ -1,3 +1,3 @@\n"
+            " context\n"
+            "-old\n"
+            "+new\n"
+            " context\n"
+        )
+        parsed = parse_unified_diff(patch_text)
+        assert len(parsed) == 1
+        assert parsed[0].change_type.value == "renamed"
+        assert parsed[0].old_path == "old_name.cpp"
+        assert parsed[0].new_path == "new_name.cpp"
+
+    def test_binary_file_produces_valid_patch(self):
+        from review_agent.patch_parser import parse_unified_diff
+
+        patch_text = (
+            "diff --git a/image.png b/image.png\n"
+            "Binary files a/image.png and b/image.png differ\n"
+        )
+        parsed = parse_unified_diff(patch_text)
+        assert len(parsed) == 1
+        assert parsed[0].is_binary is True
+
+    def test_multiple_files_produces_multiple_changes(self):
+        from review_agent.patch_parser import parse_unified_diff
+
+        patch_text = (
+            "diff --git a/a.cpp b/a.cpp\n"
+            "--- a/a.cpp\n"
+            "+++ b/a.cpp\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+            "diff --git a/b.cpp b/b.cpp\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/b.cpp\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+new file\n"
+        )
+        parsed = parse_unified_diff(patch_text)
+        assert len(parsed) == 2
+
+    def test_old_gitlab_format_without_diff_header_fails_fast(self):
+        """The old GitLab format (---/+++ only, no diff --git) should produce
+        0 changes and the orchestrator should raise InputNormalizationError."""
+        from review_agent.patch_parser import parse_unified_diff
+
+        old_format = (
+            "--- a/file.cpp\n"
+            "+++ b/file.cpp\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        parsed = parse_unified_diff(old_format)
+        assert len(parsed) == 0  # This is the bug that was fixed
+
+
+# ---------------------------------------------------------------------------
+# Cache correctness
+# ---------------------------------------------------------------------------
+
+class TestCacheCorrectness:
+    def test_version_change_invalidates_cache(self, tmp_path):
+        """Changing agent/prompt/parser version in the policy dict must
+        produce a different cache key."""
+        from review_agent.review_cache import ReviewTraceCache
+
+        cache = ReviewTraceCache(str(tmp_path))
+        base_policy = {
+            "fail_on_severity": "high",
+            "llm_model": "openai:gpt-4o",
+            "agent_version": "0.1.0",
+            "prompt_version": "2026-01-01",
+            "parser_version": "1",
+        }
+        key_v1 = cache.make_key(
+            workspace_id="ws", base_sha="a" * 40, head_sha="b" * 40,
+            target_sha="", merge_sha="", patch_text="diff",
+            policy=base_policy,
+        )
+
+        updated_policy = {**base_policy, "agent_version": "0.2.0"}
+        key_v2 = cache.make_key(
+            workspace_id="ws", base_sha="a" * 40, head_sha="b" * 40,
+            target_sha="", merge_sha="", patch_text="diff",
+            policy=updated_policy,
+        )
+        assert key_v1 != key_v2
+
+    def test_cache_hit_does_not_call_view_materialization(self, tmp_path):
+        """When a cache hit occurs, _prepare_views should NOT be called."""
+        from review_agent.review_cache import ReviewTraceCache
+
+        cache = ReviewTraceCache(str(tmp_path))
+        report = ReviewReport(
+            workspace_id="ws", summary="cached",
+            findings=[],
+            coverage=CoverageSummary(),
+            decision=ReviewDecision(fail_threshold=Severity.HIGH, blocking_findings=0, should_block=False),
+        )
+
+        # Pre-populate cache with a known key
+        key = cache.make_key(
+            workspace_id="ws", base_sha="", head_sha="",
+            target_sha="", merge_sha="",
+            patch_text="diff --git a/a b/a\n",
+            policy={
+                "fail_on_severity": "high",
+                "llm_model": "openai:gpt-4o",
+                "max_symbols": 24,
+                "max_symbol_slots": 30,
+                "max_total_tool_calls": 120,
+                "parse_timeout_s": 120,
+                "parse_workers": 4,
+                "max_candidates_per_symbol": 150,
+                "max_fetch_limit": 2000,
+                "agent_version": "0.2.0",
+                "prompt_version": "2026-02-28",
+                "parser_version": "1",
+            },
+        )
+        cache.save(key, {"review_report": report.model_dump(mode="json")})
+
+        # Track whether _prepare_views gets called
+        views_called = {"count": 0}
+        original_prepare_views = ReviewOrchestrator._prepare_views
+
+        def tracking_prepare_views(self, **kw):
+            views_called["count"] += 1
+            return original_prepare_views(self, **kw)
+
+        client = _NullClient()
+        orchestrator = ReviewOrchestrator(
+            client=client,
+            planner_factory=lambda m: _FakePlanner(),
+            synthesis_factory=lambda m: _FakeSynth(),
+        )
+
+        with patch.object(ReviewOrchestrator, "_prepare_views", tracking_prepare_views):
+            req = ReviewRequest(
+                workspace_id="ws",
+                patch_text="diff --git a/a b/a\n",
+                enable_cache=True,
+                cache_dir=str(tmp_path),
+            )
+            result = orchestrator.run(req)
+
+        assert result.summary == "cached"
+        assert views_called["count"] == 0
+
+    def test_cache_corruption_does_not_crash(self, tmp_path):
+        """A corrupted cache file should not crash the run."""
+        from review_agent.review_cache import ReviewTraceCache
+
+        cache = ReviewTraceCache(str(tmp_path))
+        key = cache.make_key(
+            workspace_id="ws", base_sha="", head_sha="",
+            target_sha="", merge_sha="",
+            patch_text="diff --git a/a b/a\n",
+            policy={"fail_on_severity": "high"},
+        )
+        # Write corrupt data
+        (tmp_path / f"{key}.json").write_text("not json at all {{{", encoding="utf-8")
+
+        loaded = cache.load_report(key)
+        assert loaded is None  # Should gracefully return None
+
+
+# ---------------------------------------------------------------------------
+# TestImpact backward compatibility alias
+# ---------------------------------------------------------------------------
+
+class TestTestImpactAlias:
+    def test_alias_works(self):
+        """TestImpact should be usable as an alias for ReviewTestImpact."""
+        ti = TestImpact(confidence=0.5)
+        assert isinstance(ti, ReviewTestImpact)
+        assert ti.confidence == 0.5
+
+
+# ---------------------------------------------------------------------------
+# ReviewRequest model
+# ---------------------------------------------------------------------------
+
+class TestReviewRequestModel:
+    def test_infra_fail_mode_default(self):
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+        )
+        assert req.infra_fail_mode == "block"
+
+    def test_infra_fail_mode_pass(self):
+        req = ReviewRequest(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            infra_fail_mode="pass",
+        )
+        assert req.infra_fail_mode == "pass"

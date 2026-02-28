@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from review_agent.models import ReviewReport
+from review_agent.models import ReviewExecutionStatus, ReviewReport
 
 logger = logging.getLogger("review_agent.report_renderer")
 
@@ -16,10 +16,23 @@ def render_markdown(report: ReviewReport) -> str:
     lines.append("")
     lines.append(f"- Workspace: `{report.workspace_id}`")
     lines.append(f"- Generated at: `{report.generated_at}`")
-    lines.append(f"- Decision: `{'BLOCK' if report.decision.should_block else 'PASS'}`")
+    if report.run_id:
+        lines.append(f"- Run ID: `{report.run_id}`")
+
+    exec_status = report.decision.execution_status
+    if exec_status == ReviewExecutionStatus.INDETERMINATE:
+        lines.append(f"- Decision: `INDETERMINATE` ({report.decision.indeterminate_reason})")
+    else:
+        lines.append(f"- Decision: `{'BLOCK' if report.decision.should_block else 'PASS'}`")
     lines.append(
         f"- Threshold: `{report.decision.fail_threshold.value}` (blocking findings: {report.decision.blocking_findings})"
     )
+    lines.append(f"- Execution status: `{exec_status.value}`")
+
+    if report.run_metadata:
+        lines.append(f"- Agent version: `{report.run_metadata.agent_version}`")
+        lines.append(f"- Input mode: `{report.run_metadata.input_mode}`")
+
     lines.append("")
     lines.append("## Summary")
     lines.append("")
@@ -41,6 +54,8 @@ def render_markdown(report: ReviewReport) -> str:
                 lines.append(f"- Symbols: `{', '.join(finding.related_symbols)}`")
             if finding.related_repos:
                 lines.append(f"- Repos: `{', '.join(finding.related_repos)}`")
+            if finding.diff_path and finding.diff_line > 0:
+                lines.append(f"- Location: `{finding.diff_path}:{finding.diff_line}`")
             if finding.evidence:
                 lines.append("- Evidence:")
                 for ev in finding.evidence:
@@ -62,6 +77,9 @@ def render_markdown(report: ReviewReport) -> str:
         lines.append(f"- Changed hunks: `{report.fact_sheet.changed_hunk_count}`")
         lines.append(f"- Seed symbols: `{len(report.fact_sheet.seed_symbols)}`")
         lines.append(f"- Suspicious anchors: `{len(report.fact_sheet.suspicious_anchors)}`")
+
+        if report.fact_sheet.merge_analysis_degraded:
+            lines.append("- ⚠ Merge-aware analysis: `degraded`")
 
         # Merge delta signals
         if report.fact_sheet.merge_delta_signals:

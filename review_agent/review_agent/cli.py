@@ -10,10 +10,21 @@ import sys
 from pathlib import Path
 
 from review_agent.config import AgentSettings
-from review_agent.models import ReviewContextBundle, ReviewRequest, Severity
+from review_agent.models import (
+    ReviewContextBundle,
+    ReviewExecutionStatus,
+    ReviewRequest,
+    Severity,
+)
 from review_agent.orchestrator import ReviewOrchestrator
 
 logger = logging.getLogger("review_agent.cli")
+
+# Exit codes
+EXIT_PASS = 0
+EXIT_ERROR = 1
+EXIT_BLOCK = 2
+EXIT_INDETERMINATE = 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,6 +52,11 @@ def main(argv: list[str] | None = None) -> int:
     # Resolve max_symbol_slots: prefer new flag, fall back to deprecated --max-tool-rounds, then env
     max_symbol_slots = args.max_symbol_slots or args.max_tool_rounds or settings.max_symbol_slots
 
+    # Resolve infra fail mode
+    infra_fail_mode = (args.infra_fail_mode or "block").lower()
+    if infra_fail_mode not in {"block", "pass"}:
+        infra_fail_mode = "block"
+
     request = ReviewRequest(
         workspace_id=args.workspace_id,
         patch_text=patch_text,
@@ -58,6 +74,7 @@ def main(argv: list[str] | None = None) -> int:
         review_timeout_s=args.review_timeout_s or settings.review_timeout_s,
         enable_cache=not args.no_cache if args.no_cache else settings.enable_cache,
         cache_dir=args.cache_dir or settings.cache_dir,
+        infra_fail_mode=infra_fail_mode,
     )
 
     orchestrator = ReviewOrchestrator()
@@ -66,43 +83,116 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         logger.error("review execution failed: %s", exc)
         print(f"[ERROR] review execution failed: {exc}", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
 
     out_dir = Path(args.out_dir).resolve()
     md_path, json_path = orchestrator.write_report_files(report, out_dir)
     print(f"[INFO] markdown report: {md_path}")
     print(f"[INFO] json report: {json_path}")
+
+    exec_status = report.decision.execution_status
     print(
         f"[INFO] findings={len(report.findings)} "
         f"blocking={report.decision.blocking_findings} "
-        f"threshold={report.decision.fail_threshold.value}"
+        f"threshold={report.decision.fail_threshold.value} "
+        f"status={exec_status.value}"
     )
+    if report.run_id:
+        print(f"[INFO] run_id={report.run_id}")
 
-    # Post review summary to GitLab MR if flags provided
+    # Post review results to GitLab MR if flags provided
     if args.gitlab_url and args.project_id and args.mr_iid:
         gitlab_token = args.gitlab_token or os.getenv("REVIEW_AGENT_GITLAB_TOKEN", "")
         if not gitlab_token:
             logger.warning("--gitlab-token or REVIEW_AGENT_GITLAB_TOKEN not set; skipping MR comment")
         else:
-            try:
-                from review_agent.tool_clients.gitlab_client import GitLabClient
+            _publish_to_gitlab(
+                args=args,
+                token=gitlab_token,
+                report=report,
+                publish_inline=bool(args.publish_inline_comments),
+            )
 
-                gl = GitLabClient(
-                    base_url=args.gitlab_url,
-                    private_token=gitlab_token,
-                )
-                from review_agent.report_renderer import render_markdown as _render_md
-                body = _render_md(report)
-                gl.post_mr_note(
-                    project_id=args.project_id,
-                    mr_iid=int(args.mr_iid),
-                    body=body,
-                )
-                logger.info("posted review summary to MR !%s", args.mr_iid)
-            except Exception as exc:
-                logger.error("failed to post MR comment: %s", exc)
+    # Map execution status to exit code
+    if exec_status == ReviewExecutionStatus.INDETERMINATE:
+        return EXIT_INDETERMINATE if report.decision.should_block else EXIT_PASS
+    return EXIT_BLOCK if report.decision.should_block else EXIT_PASS
 
-    return 2 if report.decision.should_block else 0
+
+def _publish_to_gitlab(
+    *,
+    args: argparse.Namespace,
+    token: str,
+    report,
+    publish_inline: bool,
+) -> None:
+    """Post review summary (and optionally inline comments) to GitLab MR."""
+    try:
+        from review_agent.tool_clients.gitlab_client import GitLabClient
+        from review_agent.report_renderer import render_markdown as _render_md
+
+        gl = GitLabClient(
+            base_url=args.gitlab_url,
+            private_token=token,
+        )
+        mr_iid = int(args.mr_iid)
+        project_id = args.project_id
+
+        # Always post the summary note
+        body = _render_md(report)
+        gl.post_mr_note(
+            project_id=project_id,
+            mr_iid=mr_iid,
+            body=body,
+        )
+        logger.info("posted review summary to MR !%s", mr_iid)
+
+        # Optionally post inline discussions for positioned findings
+        if publish_inline and report.findings:
+            diff_refs = {}
+            if report.run_metadata and hasattr(report, '_context_bundle_cache'):
+                pass  # We'll fetch from MR metadata
+            # Try to get diff_refs from context bundle
+            bundle = getattr(report, '_context_bundle', None)
+            base_sha = ""
+            head_sha = ""
+            start_sha = ""
+            if hasattr(args, 'project_id'):
+                try:
+                    meta = gl.get_mr_metadata(project_id=project_id, mr_iid=mr_iid)
+                    diff_refs = meta.get("diff_refs", {})
+                    base_sha = str(diff_refs.get("base_sha", ""))
+                    head_sha = str(diff_refs.get("head_sha", ""))
+                    start_sha = str(diff_refs.get("start_sha", ""))
+                except Exception as exc:
+                    logger.warning("failed to fetch MR diff_refs for inline comments: %s", exc)
+
+            for finding in report.findings:
+                if not finding.diff_path or finding.diff_line <= 0:
+                    continue
+                try:
+                    inline_body = (
+                        f"**[{finding.severity.value.upper()}]** {finding.title}\n\n"
+                        f"{finding.impact}\n\n"
+                        f"**Recommendation:** {finding.recommendation}"
+                    )
+                    gl.post_mr_inline_discussion(
+                        project_id=project_id,
+                        mr_iid=mr_iid,
+                        body=inline_body,
+                        new_path=finding.diff_path,
+                        new_line=finding.diff_line,
+                        base_sha=base_sha,
+                        head_sha=head_sha,
+                        start_sha=start_sha,
+                    )
+                    logger.info("posted inline comment on %s:%d", finding.diff_path, finding.diff_line)
+                except Exception as exc:
+                    logger.warning("failed to post inline comment for finding %s: %s", finding.id, exc)
+
+        gl.close()
+    except Exception as exc:
+        logger.error("failed to publish to GitLab: %s", exc)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -134,11 +224,22 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-cache", action="store_true", default=False, help="Disable local review trace cache")
     run.add_argument("--cache-dir", default="", help="Directory for review trace cache")
 
+    # Infrastructure policy
+    run.add_argument(
+        "--infra-fail-mode", default="block",
+        choices=["block", "pass"],
+        help="CI behavior on indeterminate results: 'block' (default) or 'pass'",
+    )
+
     # GitLab integration flags
     run.add_argument("--gitlab-url", default="", help="GitLab instance base URL (e.g. https://gitlab.com)")
     run.add_argument("--gitlab-token", default="", help="GitLab private/project access token (prefer REVIEW_AGENT_GITLAB_TOKEN env var)")
     run.add_argument("--project-id", default="", help="GitLab project ID (numeric or URL-encoded path)")
     run.add_argument("--mr-iid", default="", help="GitLab Merge Request IID")
+    run.add_argument(
+        "--publish-inline-comments", action="store_true", default=False,
+        help="Post inline discussion threads on positioned findings (requires --gitlab-url, --project-id, --mr-iid)",
+    )
     return parser
 
 
@@ -170,6 +271,9 @@ def _load_from_gitlab(args: argparse.Namespace, token: str) -> tuple[str, Review
     metadata = gl.get_mr_metadata(project_id=project_id, mr_iid=mr_iid)
     diff_text = gl.get_mr_diff(project_id=project_id, mr_iid=mr_iid)
 
+    # Derive primary_repo_id from project path or ID
+    primary_repo_id = str(metadata.get("path_with_namespace", "") or project_id)
+
     bundle = ReviewContextBundle(
         workspace_id=args.workspace_id,
         patch_text=diff_text,
@@ -177,6 +281,10 @@ def _load_from_gitlab(args: argparse.Namespace, token: str) -> tuple[str, Review
         head_sha=str(metadata.get("diff_refs", {}).get("head_sha", "")),
         target_branch_head_sha=str(metadata.get("diff_refs", {}).get("start_sha", "")),
         merge_preview_sha=str(metadata.get("merge_commit_sha", "") or ""),
+        primary_repo_id=primary_repo_id,
+        per_repo_shas={
+            primary_repo_id: str(metadata.get("diff_refs", {}).get("head_sha", "")),
+        } if primary_repo_id else {},
         pr_metadata={
             "mr_id": str(metadata.get("iid", "")),
             "pr_id": str(metadata.get("iid", "")),
@@ -186,6 +294,7 @@ def _load_from_gitlab(args: argparse.Namespace, token: str) -> tuple[str, Review
             "web_url": str(metadata.get("web_url", "")),
         },
     )
+    gl.close()
     return diff_text, bundle
 
 

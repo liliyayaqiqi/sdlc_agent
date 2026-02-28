@@ -14,8 +14,52 @@ from review_agent.orchestrator import ReviewOrchestrator
 
 
 class _FakeClient:
+    base_url = "http://127.0.0.1:8000"
+
     def workspace_info(self):
         return {"workspace_id": "ws_main", "contexts": ["ws_main:baseline"], "repos": ["repoA"]}
+
+    def context_create_pr_overlay(self, **kw):
+        return {"context_id": kw.get("context_id", "ctx")}
+
+    def context_expire(self, **kw):
+        return {}
+
+    def sync_repo(self, **kw):
+        return {}
+
+    def explore_rg_search(self, **kw):
+        return {"hits": []}
+
+    def explore_list_candidates(self, **kw):
+        return {"candidates": []}
+
+    def explore_classify_freshness(self, **kw):
+        return {"stale": [], "fresh": [], "unparsed": []}
+
+    def explore_parse_file(self, **kw):
+        return {"parsed_file_keys": [], "failed_file_keys": []}
+
+    def explore_fetch_symbols(self, **kw):
+        return {"symbols": []}
+
+    def explore_fetch_references(self, **kw):
+        return {"references": []}
+
+    def explore_fetch_call_edges(self, **kw):
+        return {"edges": []}
+
+    def explore_get_confidence(self, **kw):
+        return {"confidence": {}}
+
+    def explore_read_file(self, **kw):
+        return {"content": ""}
+
+    def agent_investigate_symbol(self, **kw):
+        return {"summary_markdown": ""}
+
+    def close(self):
+        pass
 
 
 class _FakeResult:

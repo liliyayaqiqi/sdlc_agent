@@ -79,7 +79,13 @@ class GitLabClient:
         return self._get(path)
 
     def get_mr_diff(self, *, project_id: str, mr_iid: int) -> str:
-        """Fetch the full MR diff as a single unified patch string."""
+        """Fetch the full MR diff as a proper unified git patch string.
+
+        The GitLab ``/changes`` endpoint returns per-file change records
+        with partial diff hunks.  This method reconstructs a full unified
+        diff with ``diff --git a/… b/…`` headers that ``parse_unified_diff``
+        expects.
+        """
         path = f"/api/v4/projects/{quote(str(project_id), safe='')}/merge_requests/{mr_iid}/changes"
         data = self._get(path)
         changes = data.get("changes", [])
@@ -87,12 +93,42 @@ class GitLabClient:
             return ""
         parts: list[str] = []
         for ch in changes:
-            diff = ch.get("diff", "")
-            if diff:
-                old_path = ch.get("old_path", "")
-                new_path = ch.get("new_path", "")
-                header = f"--- a/{old_path}\n+++ b/{new_path}\n"
-                parts.append(header + diff)
+            diff_body = str(ch.get("diff", "") or "")
+            old_path = str(ch.get("old_path", "") or "")
+            new_path = str(ch.get("new_path", "") or "")
+            is_new = bool(ch.get("new_file", False))
+            is_deleted = bool(ch.get("deleted_file", False))
+            is_renamed = bool(ch.get("renamed_file", False))
+
+            # -- Reconstruct the full git diff header --------------------
+            lines: list[str] = []
+            lines.append(f"diff --git a/{old_path} b/{new_path}")
+
+            if is_new:
+                lines.append("new file mode 100644")
+            elif is_deleted:
+                lines.append("deleted file mode 100644")
+            elif is_renamed:
+                lines.append(f"rename from {old_path}")
+                lines.append(f"rename to {new_path}")
+
+            # --- / +++ markers
+            if is_new:
+                lines.append("--- /dev/null")
+                lines.append(f"+++ b/{new_path}")
+            elif is_deleted:
+                lines.append(f"--- a/{old_path}")
+                lines.append("+++ /dev/null")
+            else:
+                lines.append(f"--- a/{old_path}")
+                lines.append(f"+++ b/{new_path}")
+
+            if diff_body:
+                # Strip any leading newline from the hunk body
+                lines.append(diff_body.lstrip("\n"))
+
+            parts.append("\n".join(lines))
+
         return "\n".join(parts)
 
     def post_mr_note(self, *, project_id: str, mr_iid: int, body: str) -> dict[str, Any]:

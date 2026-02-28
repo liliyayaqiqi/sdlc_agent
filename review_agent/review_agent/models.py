@@ -9,6 +9,35 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+# ---------------------------------------------------------------------------
+# Version constant – bump on breaking prompt/parser/model changes
+# ---------------------------------------------------------------------------
+
+AGENT_VERSION = "0.2.0"
+PROMPT_VERSION = "2026-02-28"
+PARSER_VERSION = "1"
+
+
+# ---------------------------------------------------------------------------
+# Typed errors
+# ---------------------------------------------------------------------------
+
+class InputNormalizationError(RuntimeError):
+    """Raised when diff/patch input cannot be normalized into ≥1 PatchChange."""
+
+
+class InfrastructureError(RuntimeError):
+    """Raised on backend / network / resource failures during review."""
+
+
+class PublishingError(RuntimeError):
+    """Raised when posting review results to a VCS host fails."""
+
+
+# ---------------------------------------------------------------------------
+# Enumerations
+# ---------------------------------------------------------------------------
+
 class Severity(str, Enum):
     """Finding severity ordered from highest impact to lowest."""
 
@@ -37,6 +66,26 @@ class FindingCategory(str, Enum):
     CONFIDENCE_GAP = "confidence_gap"
 
 
+class ReviewExecutionStatus(str, Enum):
+    """Three-state execution outcome for CI gating.
+
+    * **pass** – review completed, no blocking findings.
+    * **block** – review completed, blocking findings present.
+    * **indeterminate** – review could not complete reliably
+      (timeout, backend failure, normalization failure, cache decode
+      failure, partial merge materialization, etc.).  CI policy should
+      decide whether indeterminate blocks or not.
+    """
+
+    PASS = "pass"
+    BLOCK = "block"
+    INDETERMINATE = "indeterminate"
+
+
+# ---------------------------------------------------------------------------
+# Evidence and findings
+# ---------------------------------------------------------------------------
+
 class EvidenceRef(BaseModel):
     """Concrete evidence supporting a finding."""
 
@@ -63,6 +112,9 @@ class ReviewFinding(BaseModel):
     related_symbols: list[str] = Field(default_factory=list)
     related_repos: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
+    # Diff position for inline publishing (optional)
+    diff_path: str = ""
+    diff_line: int = 0
 
 
 class CoverageSummary(BaseModel):
@@ -86,13 +138,23 @@ class ToolCallRecord(BaseModel):
     note: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Decision
+# ---------------------------------------------------------------------------
+
 class ReviewDecision(BaseModel):
-    """Final CI/blocking decision."""
+    """Final CI/blocking decision with three-state execution status."""
 
     fail_threshold: Severity
     blocking_findings: int
     should_block: bool
+    execution_status: ReviewExecutionStatus = ReviewExecutionStatus.PASS
+    indeterminate_reason: str = ""
 
+
+# ---------------------------------------------------------------------------
+# Diff / patch models
+# ---------------------------------------------------------------------------
 
 class HunkLine(BaseModel):
     """A line inside one unified-diff hunk."""
@@ -139,6 +201,10 @@ class PatchChange(BaseModel):
         return self.new_path
 
 
+# ---------------------------------------------------------------------------
+# Pre-pass artifacts
+# ---------------------------------------------------------------------------
+
 class SeedSymbol(BaseModel):
     """A symbol candidate extracted from changed code."""
 
@@ -171,6 +237,10 @@ class PrepassResult(BaseModel):
     include_macro_config_changes: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
+
+# ---------------------------------------------------------------------------
+# Evidence collection artifacts
+# ---------------------------------------------------------------------------
 
 class SymbolImpact(BaseModel):
     """Semantic impact bundle for one symbol investigation."""
@@ -226,6 +296,10 @@ class SymbolFact(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Plans and views
+# ---------------------------------------------------------------------------
+
 class ReviewPlan(BaseModel):
     """LLM-generated review plan controlling deterministic evidence collection."""
 
@@ -249,6 +323,10 @@ class ViewContextMaterialization(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Fact sheet
+# ---------------------------------------------------------------------------
+
 class ReviewFactSheet(BaseModel):
     """Deterministic fact layer that powers synthesis and policy gating."""
 
@@ -265,10 +343,15 @@ class ReviewFactSheet(BaseModel):
     coverage: CoverageSummary = Field(default_factory=CoverageSummary)
     view_contexts: ViewContextMaterialization = Field(default_factory=ViewContextMaterialization)
     merge_delta_signals: list[dict[str, Any]] = Field(default_factory=list)
+    merge_analysis_degraded: bool = False
     warnings: list[str] = Field(default_factory=list)
 
 
-class TestImpact(BaseModel):
+# ---------------------------------------------------------------------------
+# Test impact (renamed to avoid pytest collection collision)
+# ---------------------------------------------------------------------------
+
+class ReviewTestImpact(BaseModel):
     """Deterministic test-impact recommendation output."""
 
     directly_impacted_tests: list[str] = Field(default_factory=list)
@@ -278,6 +361,29 @@ class TestImpact(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     test_dependency_edges: list[dict[str, Any]] = Field(default_factory=list)
 
+
+# Backward-compat alias (deprecated)
+TestImpact = ReviewTestImpact
+
+
+# ---------------------------------------------------------------------------
+# Run metadata and cache envelope
+# ---------------------------------------------------------------------------
+
+class RunMetadata(BaseModel):
+    """Versioning envelope included in cache keys and report output."""
+
+    agent_version: str = AGENT_VERSION
+    prompt_version: str = PROMPT_VERSION
+    parser_version: str = PARSER_VERSION
+    input_mode: str = ""  # "patch_file", "context_bundle", "gitlab_mr"
+    run_id: str = ""
+    backend_base_url: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Final report
+# ---------------------------------------------------------------------------
 
 class ReviewReport(BaseModel):
     """Final review report in structured form."""
@@ -290,8 +396,14 @@ class ReviewReport(BaseModel):
     generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     tool_usage: list[ToolCallRecord] = Field(default_factory=list)
     fact_sheet: ReviewFactSheet | None = None
-    test_impact: TestImpact | None = None
+    test_impact: ReviewTestImpact | None = None
+    run_metadata: RunMetadata | None = None
+    run_id: str = ""
 
+
+# ---------------------------------------------------------------------------
+# Context bundle and request
+# ---------------------------------------------------------------------------
 
 class ReviewContextBundle(BaseModel):
     """PR/MR-driven review context bundle."""
@@ -329,6 +441,7 @@ class ReviewRequest(BaseModel):
     review_timeout_s: int = 0
     enable_cache: bool = True
     cache_dir: str = ".review_agent_cache"
+    infra_fail_mode: str = "block"  # "block" or "pass"
 
     @model_validator(mode="after")
     def _validate_request(self) -> "ReviewRequest":
