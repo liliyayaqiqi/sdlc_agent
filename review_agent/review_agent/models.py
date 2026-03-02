@@ -25,6 +25,7 @@ RepoRevisionRole = Literal["primary", "dependency", "auxiliary"]
 SeedRelevanceTier = Literal["declaration", "qualified", "receiver_owned", "generic_fallback"]
 DeclarationKind = Literal["function", "method", "constructor", "destructor", "class", "struct", "enum"]
 DiffLineKind = Literal["add", "del"]
+RetrievalStatus = Literal["bootstrapped", "expanded", "empty", "failed"]
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +341,8 @@ class SymbolImpact(BaseModel):
     rg_hits: list[dict[str, Any]] = Field(default_factory=list)
     read_contexts: list[dict[str, Any]] = Field(default_factory=list)
     confidence: dict[str, Any] = Field(default_factory=dict)
+    candidate_provenance: list[str] = Field(default_factory=list)
+    retrieval_status: RetrievalStatus = "empty"
     macro_summary: str = ""
     warnings: list[str] = Field(default_factory=list)
 
@@ -374,7 +377,22 @@ class SymbolFact(BaseModel):
     merge_preview_call_edge_count: int = 0
     reference_delta_vs_baseline: int = 0
     call_edge_delta_vs_baseline: int = 0
+    confidence: "SymbolConfidence" = Field(default_factory=lambda: SymbolConfidence())
+    candidate_provenance: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class SymbolConfidence(BaseModel):
+    """Confidence and retrieval metadata for one investigated symbol."""
+
+    verified_ratio: float = 0.0
+    total_candidates: int = 0
+    verified_files: list[str] = Field(default_factory=list)
+    stale_files: list[str] = Field(default_factory=list)
+    unparsed_files: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    candidate_sources: list[str] = Field(default_factory=list)
+    retrieval_status: RetrievalStatus = "empty"
 
 
 # ---------------------------------------------------------------------------
@@ -477,8 +495,13 @@ class PrepassDebug(BaseModel):
 
     ranked_seed_candidates: list[SeedSymbol] = Field(default_factory=list)
     changed_declarations: list[ChangedDeclaration] = Field(default_factory=list)
+    raw_changed_declarations: list[ChangedDeclaration] = Field(default_factory=list)
+    semantic_changed_declarations: list[ChangedDeclaration] = Field(default_factory=list)
     member_call_sites_top: list[MemberCallSite] = Field(default_factory=list)
     diff_excerpt_reasons: list[str] = Field(default_factory=list)
+    bootstrap_file_keys: list[str] = Field(default_factory=list)
+    bootstrap_seeded_symbols: list[dict[str, Any]] = Field(default_factory=list)
+    zero_candidate_symbols: list[str] = Field(default_factory=list)
     retrieval_widening_events: list[dict[str, Any]] = Field(default_factory=list)
 
 class RunMetadata(BaseModel):

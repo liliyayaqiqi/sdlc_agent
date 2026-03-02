@@ -90,6 +90,17 @@ def render_markdown(report: ReviewReport) -> str:
         lines.append(f"- Suspicious anchors: `{len(report.fact_sheet.suspicious_anchors)}`")
         lines.append(f"- Changed declarations: `{len(report.fact_sheet.changed_declarations)}`")
         lines.append(f"- Member call sites: `{len(report.fact_sheet.member_call_sites)}`")
+        if report.fact_sheet.symbol_facts:
+            lines.append("")
+            lines.append("### Symbol Confidence")
+            lines.append("")
+            for sf in report.fact_sheet.symbol_facts[:20]:
+                lines.append(
+                    f"- `{sf.symbol}` candidates={sf.confidence.total_candidates} "
+                    f"verified_ratio={sf.confidence.verified_ratio:.2f} "
+                    f"retrieval={sf.confidence.retrieval_status} "
+                    f"provenance={', '.join(sf.candidate_provenance[:4]) or 'n/a'}"
+                )
 
         if report.fact_sheet.merge_analysis_degraded:
             lines.append("- ⚠ Merge-aware analysis: `degraded`")
@@ -126,6 +137,29 @@ def render_markdown(report: ReviewReport) -> str:
                     f"  - `{seed.symbol}` [{seed.relevance_tier}] score={seed.score:.2f} "
                     f"reasons={', '.join(seed.reasons[:3])}"
                 )
+        if debug.raw_changed_declarations:
+            lines.append("- Raw changed declarations:")
+            for decl in debug.raw_changed_declarations[:10]:
+                lines.append(f"  - `{decl.symbol}` ({decl.kind}) {decl.file_path}:{decl.line}")
+        if debug.semantic_changed_declarations:
+            lines.append("- Semantic changed declarations:")
+            for decl in debug.semantic_changed_declarations[:10]:
+                lines.append(f"  - `{decl.symbol}` ({decl.kind}) {decl.file_path}:{decl.line}")
+        if debug.bootstrap_file_keys:
+            lines.append("- Bootstrap file keys:")
+            for file_key in debug.bootstrap_file_keys[:10]:
+                lines.append(f"  - `{file_key}`")
+        if debug.bootstrap_seeded_symbols:
+            lines.append("- Bootstrap seeded symbols:")
+            for row in debug.bootstrap_seeded_symbols[:10]:
+                lines.append(
+                    f"  - `{row.get('symbol', '?')}` -> `{', '.join(row.get('file_keys', [])[:3])}` "
+                    f"reasons={', '.join(row.get('reasons', [])[:3])}"
+                )
+        if debug.zero_candidate_symbols:
+            lines.append("- Zero-candidate symbols:")
+            for symbol in debug.zero_candidate_symbols[:10]:
+                lines.append(f"  - `{symbol}`")
         if debug.diff_excerpt_reasons:
             lines.append("- Diff excerpt reasons:")
             for reason in debug.diff_excerpt_reasons[:10]:

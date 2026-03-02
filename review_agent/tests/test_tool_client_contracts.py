@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from unittest.mock import patch
 
 import pytest
@@ -107,6 +108,44 @@ def test_macro_tool_paths_include_workspace_binding():
     assert captured["headers"]["x-cxxtract-workspace-id"] == "ws_main"
 
 
+def test_macro_tool_accepts_contextual_candidate_file_keys():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _Resp()
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        client.agent_investigate_symbol(
+            symbol="auth::Session::Start",
+            analysis_context={"mode": "pr", "context_id": "ctx1"},
+            candidate_file_keys=["repoA:src/main.cpp"],
+        )
+
+    assert captured["json"]["analysis_context"]["context_id"] == "ctx1"
+    assert captured["json"]["candidate_file_keys"] == ["repoA:src/main.cpp"]
+
+
 def test_explore_candidates_accepts_analysis_context():
     captured = {}
 
@@ -146,6 +185,132 @@ def test_explore_candidates_accepts_analysis_context():
     assert captured["url"].endswith("/explore/list-candidates")
     assert captured["json"]["analysis_context"]["context_id"] == "ctx1"
     assert captured["json"]["scope"]["path_prefixes"] == ["src/module"]
+
+
+def test_explore_candidates_accepts_bootstrap_file_keys():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"candidates": []}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _Resp()
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        client.explore_list_candidates(
+            symbol="foo",
+            max_files=10,
+            bootstrap_file_keys=["repoA:src/module/a.cpp"],
+        )
+
+    assert captured["json"]["bootstrap_file_keys"] == ["repoA:src/module/a.cpp"]
+
+
+def test_explore_candidates_retries_without_unsupported_bootstrap_field():
+    captured = {"requests": []}
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self.text = ""
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["requests"].append(copy.deepcopy(json))
+            if len(captured["requests"]) == 1:
+                return _Resp(
+                    422,
+                    {
+                        "detail": [
+                            {
+                                "type": "extra_forbidden",
+                                "loc": ["body", "bootstrap_file_keys"],
+                                "msg": "Extra inputs are not permitted",
+                            }
+                        ]
+                    },
+                )
+            return _Resp(200, {"candidates": ["repoA:src/module/a.cpp"], "warnings": []})
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        body = client.explore_list_candidates(
+            symbol="foo",
+            max_files=10,
+            bootstrap_file_keys=["repoA:src/module/a.cpp"],
+        )
+
+    assert len(captured["requests"]) == 2
+    assert "bootstrap_file_keys" in captured["requests"][0]
+    assert "bootstrap_file_keys" not in captured["requests"][1]
+    assert body["candidates"] == ["repoA:src/module/a.cpp"]
+    assert "server_unsupported_optional_field:bootstrap_file_keys" in body["warnings"]
+
+
+def test_query_file_symbols_uses_expected_path():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"file_key": "repoA:src/main.cpp", "symbols": []}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _Resp()
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        client.query_file_symbols(file_key="repoA:src/main.cpp", analysis_context={"mode": "pr"})
+
+    assert captured["url"].endswith("/query/file-symbols")
+    assert captured["json"]["file_key"] == "repoA:src/main.cpp"
+    assert captured["json"]["analysis_context"]["mode"] == "pr"
 
 
 def test_gitlab_get_retries_on_transient_error():

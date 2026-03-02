@@ -26,6 +26,7 @@ from review_agent.manifest_resolver import (
 )
 from review_agent.models import (
     AGENT_VERSION,
+    ChangedDeclaration,
     CoverageSummary,
     EvidenceRef,
     InfrastructureError,
@@ -43,9 +44,11 @@ from review_agent.models import (
     ReviewTestImpact,
     RunMetadata,
     Severity,
+    SymbolConfidence,
     SymbolFact,
     SymbolImpact,
     SynthesisDraft,
+    SeedSymbol,
     ToolCallRecord,
     ViewContextMaterialization,
 )
@@ -143,6 +146,23 @@ class RetrievalStage:
     entry_repos: list[str]
     max_repo_hops: int
     path_prefixes: list[str]
+
+
+@dataclass
+class BootstrapContext:
+    """Changed-file bootstrap metadata and semantic declaration enrichment."""
+
+    changed_file_keys: list[str]
+    changed_file_keys_by_repo: dict[str, list[str]]
+    changed_file_keys_by_path: dict[str, str]
+    raw_changed_declarations: list[ChangedDeclaration]
+    semantic_changed_declarations: list[ChangedDeclaration]
+    bootstrap_seed_map: dict[str, list[str]]
+    verified_files: list[str]
+    stale_files: list[str]
+    unparsed_files: list[str]
+    warnings: list[str]
+    bootstrap_seeded_symbols: list[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +365,13 @@ class ReviewOrchestrator:
                 "prepass_debug": PrepassDebug(
                     ranked_seed_candidates=prepass.seed_symbols[:24],
                     changed_declarations=prepass.changed_declarations[:40],
+                    raw_changed_declarations=prepass.changed_declarations[:40],
+                    semantic_changed_declarations=[],
                     member_call_sites_top=prepass.member_call_sites[:40],
                     diff_excerpt_reasons=[excerpt.reason for excerpt in prepass.diff_excerpts[:20]],
+                    bootstrap_file_keys=[],
+                    bootstrap_seeded_symbols=[],
+                    zero_candidate_symbols=[],
                     retrieval_widening_events=[],
                 )
             }
@@ -403,6 +428,16 @@ class ReviewOrchestrator:
             logger.info("[%s] cache miss for key %s", run_id, cache_key[:16])
 
         # --- View materialization (only on cache miss) ---
+        tool_usage: list[ToolCallRecord] = []
+        budget = BudgetTracker(
+            max_symbol_slots=runtime.max_symbol_slots,
+            max_total_tool_calls=runtime.max_total_tool_calls,
+            max_symbols=runtime.max_symbols,
+            max_candidates_per_symbol=runtime.max_candidates_per_symbol,
+            max_fetch_limit=runtime.max_fetch_limit,
+            parse_timeout_s=runtime.parse_timeout_s,
+            parse_workers=runtime.parse_workers,
+        )
         logger.info("[%s] preparing views", run_id)
         views = self._prepare_views(
             client=client, runtime_context=bundle,
@@ -416,17 +451,32 @@ class ReviewOrchestrator:
             views.status.merge_preview_materialized,
             len(views.status.warnings),
         )
-        tool_usage: list[ToolCallRecord] = []
-
-        budget = BudgetTracker(
-            max_symbol_slots=runtime.max_symbol_slots,
-            max_total_tool_calls=runtime.max_total_tool_calls,
-            max_symbols=runtime.max_symbols,
-            max_candidates_per_symbol=runtime.max_candidates_per_symbol,
-            max_fetch_limit=runtime.max_fetch_limit,
-            parse_timeout_s=runtime.parse_timeout_s,
-            parse_workers=runtime.parse_workers,
+        bootstrap = _bootstrap_changed_file_semantics(
+            client=client,
+            workspace=workspace,
+            changes=changes,
+            prepass=prepass,
+            entry_repos=entry_repos,
+            analysis_context=views.head,
+            tool_usage=tool_usage,
+            budget=budget,
         )
+        if bootstrap.warnings:
+            prepass = prepass.model_copy(update={"warnings": sorted(set(prepass.warnings + bootstrap.warnings))})
+        prepass = _apply_semantic_prepass_enrichment(prepass, bootstrap)
+        if run_metadata.prepass_debug is not None:
+            run_metadata = run_metadata.model_copy(
+                update={
+                    "prepass_debug": run_metadata.prepass_debug.model_copy(
+                        update={
+                            "changed_declarations": prepass.changed_declarations[:40],
+                            "semantic_changed_declarations": bootstrap.semantic_changed_declarations[:40],
+                            "bootstrap_file_keys": bootstrap.changed_file_keys[:80],
+                            "bootstrap_seeded_symbols": bootstrap.bootstrap_seeded_symbols[:80],
+                        }
+                    )
+                }
+            )
 
         # --- Step 1: LLM Planner ---
         _check_deadline(deadline, "planner")
@@ -473,6 +523,7 @@ class ReviewOrchestrator:
             tool_usage,
             budget,
             deadline,
+            bootstrap=bootstrap,
             retrieval_stages=retrieval_stages,
             widening_events=retrieval_widening_events,
         )
@@ -480,7 +531,10 @@ class ReviewOrchestrator:
             run_metadata = run_metadata.model_copy(
                 update={
                     "prepass_debug": run_metadata.prepass_debug.model_copy(
-                        update={"retrieval_widening_events": retrieval_widening_events[:100]}
+                        update={
+                            "retrieval_widening_events": retrieval_widening_events[:100],
+                            "zero_candidate_symbols": [impact.symbol for impact in impacts if not impact.candidate_file_keys][:80],
+                        }
                     )
                 }
             )
@@ -521,6 +575,10 @@ class ReviewOrchestrator:
             merge_analysis_degraded=merge_analysis_degraded,
             warnings=sorted(set(prepass.warnings + views.status.warnings + coverage.warnings)),
         )
+        if _semantic_bootstrap_failed(bootstrap=bootstrap, fact_sheet=fact_sheet):
+            fact_sheet = fact_sheet.model_copy(
+                update={"warnings": sorted(set(fact_sheet.warnings + ["semantic_bootstrap_failed"]))}
+            )
 
         # --- Step 5: Agent-driven follow-up exploration ---
         _check_deadline(deadline, "exploration")
@@ -791,6 +849,7 @@ class ReviewOrchestrator:
         budget: BudgetTracker,
         deadline: float = 0.0,
         *,
+        bootstrap: BootstrapContext | None = None,
         retrieval_stages: list[RetrievalStage] | None = None,
         widening_events: list[dict[str, Any]] | None = None,
     ) -> tuple[list[SymbolImpact], list[SymbolFact], CoverageSummary]:
@@ -827,6 +886,7 @@ class ReviewOrchestrator:
                 symbol,
                 tool_usage,
                 budget,
+                bootstrap_file_keys=_bootstrap_file_keys_for_symbol(symbol, bootstrap),
                 retrieval_stages=retrieval_stages or [],
                 widening_events=widening_events,
             )
@@ -855,6 +915,8 @@ class ReviewOrchestrator:
                     merge_preview_call_edge_count=merge_edges,
                     reference_delta_vs_baseline=len(impact.references) - base_refs,
                     call_edge_delta_vs_baseline=len(impact.call_edges) - base_edges,
+                    confidence=_symbol_confidence_from_impact(impact),
+                    candidate_provenance=impact.candidate_provenance,
                     warnings=sorted(set(warnings)),
                 )
             )
@@ -893,6 +955,7 @@ def _collect_symbol(
     tool_usage: list[ToolCallRecord],
     budget: BudgetTracker,
     *,
+    bootstrap_file_keys: list[str] | None = None,
     retrieval_stages: list[RetrievalStage] | None = None,
     widening_events: list[dict[str, Any]] | None = None,
 ) -> SymbolImpact:
@@ -902,7 +965,28 @@ def _collect_symbol(
     deleted: list[str] = []
     discovery_warnings: list[str] = []
     selected_stage_name = ""
+    candidate_provenance: set[str] = set()
+    bootstrap_candidates = _dedupe_file_keys(list(bootstrap_file_keys or []))
     stages = retrieval_stages or [RetrievalStage(name="repo_wide", entry_repos=[], max_repo_hops=0, path_prefixes=[])]
+
+    if bootstrap_candidates:
+        bootstrap_impact = _collect_symbol_from_candidates(
+            client=client,
+            analysis_context=analysis_context,
+            symbol=symbol,
+            tool_usage=tool_usage,
+            budget=budget,
+            candidates=bootstrap_candidates,
+            deleted=[],
+            rg_hits=[],
+            discovery_warnings=[],
+            candidate_provenance=["bootstrap_seed"],
+            selected_stage_name="bootstrap",
+        )
+        if _impact_has_semantic_signal(bootstrap_impact) or budget.exhausted:
+            return bootstrap_impact
+        discovery_warnings.extend([warn for warn in bootstrap_impact.warnings if warn != "retrieval_scope:bootstrap"])
+        candidate_provenance.update(bootstrap_impact.candidate_provenance)
 
     for idx, stage in enumerate(stages):
         logger.info(
@@ -912,22 +996,24 @@ def _collect_symbol(
             stage.entry_repos,
             stage.path_prefixes,
         )
-        stage_rg, stage_listed, stage_deleted, stage_warnings = _discover_candidates_for_stage(
+        stage_rg, stage_listed, stage_deleted, stage_warnings, stage_provenance = _discover_candidates_for_stage(
             client=client,
             analysis_context=analysis_context,
             symbol=symbol,
             tool_usage=tool_usage,
             budget=budget,
             stage=stage,
+            bootstrap_file_keys=bootstrap_candidates,
         )
         rg_hits = _merge_rg_hits(rg_hits, stage_rg)
         rg_candidates = _dedupe_file_keys(rg_candidates + [str(row.get("file_key", "")).strip() for row in stage_rg if str(row.get("file_key", "")).strip()])
         listed_candidates = _dedupe_file_keys(listed_candidates + stage_listed)
         deleted = _dedupe_file_keys(deleted + stage_deleted)
         discovery_warnings.extend(stage_warnings)
+        candidate_provenance.update(stage_provenance)
         selected_stage_name = stage.name
 
-        candidate_count = len(_dedupe_file_keys(rg_candidates + listed_candidates))
+        candidate_count = len(_dedupe_file_keys(bootstrap_candidates + rg_candidates + listed_candidates))
         logger.info(
             "candidate discovery stage complete symbol=%s stage=%s rg_hits=%d listed=%d candidates=%d deleted=%d warnings=%d",
             symbol,
@@ -949,16 +1035,144 @@ def _collect_symbol(
                 }
             )
         if budget.exhausted:
-            return _empty_impact(symbol, rg_hits=rg_hits)
-        if candidate_count >= 2 or (not stage.path_prefixes and stage.max_repo_hops == 0):
-            break
+            return _empty_impact(
+                symbol,
+                rg_hits=rg_hits,
+                candidates=_dedupe_file_keys(bootstrap_candidates + rg_candidates + listed_candidates),
+                deleted=deleted,
+                candidate_provenance=sorted(candidate_provenance),
+                retrieval_status=_determine_retrieval_status(
+                    candidates=_dedupe_file_keys(bootstrap_candidates + rg_candidates + listed_candidates),
+                    candidate_provenance=sorted(candidate_provenance),
+                    warnings=discovery_warnings,
+                ),
+            )
+        if candidate_count >= 1:
+            candidates = _dedupe_file_keys(bootstrap_candidates + rg_candidates + listed_candidates)[
+                : budget.max_candidates_per_symbol
+            ]
+            impact = _collect_symbol_from_candidates(
+                client=client,
+                analysis_context=analysis_context,
+                symbol=symbol,
+                tool_usage=tool_usage,
+                budget=budget,
+                candidates=candidates,
+                deleted=deleted,
+                rg_hits=rg_hits,
+                discovery_warnings=discovery_warnings,
+                candidate_provenance=sorted(candidate_provenance),
+                selected_stage_name=selected_stage_name,
+                candidates_truncated=len(bootstrap_candidates + rg_candidates + listed_candidates) > len(candidates),
+            )
+            if _impact_has_semantic_signal(impact) or budget.exhausted or idx == len(stages) - 1:
+                return impact
+            discovery_warnings.extend([warn for warn in impact.warnings if warn != f"retrieval_scope:{selected_stage_name}"])
+            candidate_provenance.update(impact.candidate_provenance)
 
-    candidates = _dedupe_file_keys(rg_candidates + listed_candidates)[: budget.max_candidates_per_symbol]
+    candidates = _dedupe_file_keys(bootstrap_candidates + rg_candidates + listed_candidates)[: budget.max_candidates_per_symbol]
+    return _collect_symbol_from_candidates(
+        client=client,
+        analysis_context=analysis_context,
+        symbol=symbol,
+        tool_usage=tool_usage,
+        budget=budget,
+        candidates=candidates,
+        deleted=deleted,
+        rg_hits=rg_hits,
+        discovery_warnings=discovery_warnings,
+        candidate_provenance=sorted(candidate_provenance),
+        selected_stage_name=selected_stage_name,
+        candidates_truncated=len(bootstrap_candidates + rg_candidates + listed_candidates) > len(candidates),
+    )
+
+
+def _empty_impact(
+    symbol: str,
+    *,
+    rg_hits: list[dict[str, Any]] | None = None,
+    candidates: list[str] | None = None,
+    deleted: list[str] | None = None,
+    read_contexts: list[dict[str, Any]] | None = None,
+    fresh: list[str] | None = None,
+    stale: list[str] | None = None,
+    unparsed: list[str] | None = None,
+    parsed_keys: list[str] | None = None,
+    parse_failed: list[str] | None = None,
+    candidate_provenance: list[str] | None = None,
+    retrieval_status: str = "empty",
+) -> SymbolImpact:
+    """Build a partial SymbolImpact when budget is exhausted mid-symbol."""
+    return SymbolImpact(
+        symbol=symbol,
+        candidate_file_keys=candidates or [],
+        deleted_file_keys=deleted or [],
+        fresh=fresh or [],
+        stale=stale or [],
+        unparsed=unparsed or [],
+        parsed_file_keys=parsed_keys or [],
+        parse_failed_file_keys=parse_failed or [],
+        rg_hits=(rg_hits or [])[:200],
+        read_contexts=(read_contexts or [])[:20],
+        candidate_provenance=candidate_provenance or [],
+        retrieval_status=retrieval_status,
+        warnings=["budget_exhausted_mid_symbol"],
+    )
+
+
+def _collect_symbol_from_candidates(
+    *,
+    client,
+    analysis_context,
+    symbol: str,
+    tool_usage: list[ToolCallRecord],
+    budget: BudgetTracker,
+    candidates: list[str],
+    deleted: list[str],
+    rg_hits: list[dict[str, Any]],
+    discovery_warnings: list[str],
+    candidate_provenance: list[str],
+    selected_stage_name: str,
+    candidates_truncated: bool = False,
+) -> SymbolImpact:
+    if not candidates:
+        warnings = sorted(
+            set(
+                discovery_warnings
+                + ([f"retrieval_scope:{selected_stage_name}"] if selected_stage_name else [])
+                + (["candidates_truncated"] if candidates_truncated else [])
+            )
+        )
+        return SymbolImpact(
+            symbol=symbol,
+            candidate_file_keys=[],
+            deleted_file_keys=deleted,
+            rg_hits=rg_hits[:200],
+            read_contexts=[],
+            confidence={},
+            candidate_provenance=sorted(set(candidate_provenance)),
+            retrieval_status=_determine_retrieval_status(
+                candidates=[],
+                candidate_provenance=candidate_provenance,
+                warnings=warnings,
+            ),
+            warnings=warnings,
+        )
 
     if budget.exhausted:
-        return _empty_impact(symbol, rg_hits=rg_hits, candidates=candidates, deleted=deleted)
+        return _empty_impact(
+            symbol,
+            rg_hits=rg_hits,
+            candidates=candidates,
+            deleted=deleted,
+            candidate_provenance=candidate_provenance,
+            retrieval_status=_determine_retrieval_status(
+                candidates=candidates,
+                candidate_provenance=candidate_provenance,
+                warnings=discovery_warnings,
+            ),
+        )
 
-    # --- Phase 2: Context reads ---
     read_contexts: list[dict[str, Any]] = []
     for hit in rg_hits[:2]:
         if budget.exhausted:
@@ -996,9 +1210,20 @@ def _collect_symbol(
             read_contexts.append(row)
 
     if budget.exhausted:
-        return _empty_impact(symbol, rg_hits=rg_hits, candidates=candidates, deleted=deleted, read_contexts=read_contexts)
+        return _empty_impact(
+            symbol,
+            rg_hits=rg_hits,
+            candidates=candidates,
+            deleted=deleted,
+            read_contexts=read_contexts,
+            candidate_provenance=candidate_provenance,
+            retrieval_status=_determine_retrieval_status(
+                candidates=candidates,
+                candidate_provenance=candidate_provenance,
+                warnings=discovery_warnings,
+            ),
+        )
 
-    # --- Phase 3: Parse & freshness ---
     freshness: dict[str, Any] = {}
     stale: list[str] = []
     fresh: list[str] = []
@@ -1008,40 +1233,124 @@ def _collect_symbol(
     parse_failed: list[str] = []
 
     if candidates:
-        freshness = _call(tool_usage, budget, "collector", "explore.classify_freshness", client.explore_classify_freshness, candidate_file_keys=candidates, max_files=max(1, len(candidates)), analysis_context=analysis_context)
+        freshness = _call(
+            tool_usage,
+            budget,
+            "collector",
+            "explore.classify_freshness",
+            client.explore_classify_freshness,
+            candidate_file_keys=candidates,
+            max_files=max(1, len(candidates)),
+            analysis_context=analysis_context,
+        )
         stale = list(freshness.get("stale", []) or [])
         fresh = list(freshness.get("fresh", []) or [])
         unparsed = list(freshness.get("unparsed", []) or [])
 
     if stale and not budget.exhausted:
-        parsed = _call(tool_usage, budget, "collector", "explore.parse_file", client.explore_parse_file, file_keys=stale, max_parse_workers=budget.parse_workers, timeout_s=budget.parse_timeout_s, skip_if_fresh=True, analysis_context=analysis_context)
+        parsed = _call(
+            tool_usage,
+            budget,
+            "collector",
+            "explore.parse_file",
+            client.explore_parse_file,
+            file_keys=stale,
+            max_parse_workers=budget.parse_workers,
+            timeout_s=budget.parse_timeout_s,
+            skip_if_fresh=True,
+            analysis_context=analysis_context,
+        )
         parsed_keys = list(parsed.get("parsed_file_keys", []) or [])
         parse_failed = list(parsed.get("failed_file_keys", []) or [])
 
     if budget.exhausted:
         return _empty_impact(
-            symbol, rg_hits=rg_hits, candidates=candidates, deleted=deleted,
-            read_contexts=read_contexts, fresh=fresh, stale=stale, unparsed=unparsed,
-            parsed_keys=parsed_keys, parse_failed=parse_failed,
+            symbol,
+            rg_hits=rg_hits,
+            candidates=candidates,
+            deleted=deleted,
+            read_contexts=read_contexts,
+            fresh=fresh,
+            stale=stale,
+            unparsed=unparsed,
+            parsed_keys=parsed_keys,
+            parse_failed=parse_failed,
+            candidate_provenance=candidate_provenance,
+            retrieval_status=_determine_retrieval_status(
+                candidates=candidates,
+                candidate_provenance=candidate_provenance,
+                warnings=discovery_warnings,
+            ),
         )
 
-    # --- Phase 4: Semantic fetch ---
-    sym_rows = _call(tool_usage, budget, "collector", "explore.fetch_symbols", client.explore_fetch_symbols, symbol=symbol, candidate_file_keys=candidates, excluded_file_keys=deleted, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+    sym_rows = _call(
+        tool_usage,
+        budget,
+        "collector",
+        "explore.fetch_symbols",
+        client.explore_fetch_symbols,
+        symbol=symbol,
+        candidate_file_keys=candidates,
+        excluded_file_keys=deleted,
+        limit=budget.max_fetch_limit,
+        analysis_context=analysis_context,
+    )
 
     ref_rows: dict[str, Any] = {}
     if not budget.exhausted:
-        ref_rows = _call(tool_usage, budget, "collector", "explore.fetch_references", client.explore_fetch_references, symbol=symbol, candidate_file_keys=candidates, excluded_file_keys=deleted, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+        ref_rows = _call(
+            tool_usage,
+            budget,
+            "collector",
+            "explore.fetch_references",
+            client.explore_fetch_references,
+            symbol=symbol,
+            candidate_file_keys=candidates,
+            excluded_file_keys=deleted,
+            limit=budget.max_fetch_limit,
+            analysis_context=analysis_context,
+        )
 
     edge_rows: dict[str, Any] = {}
     if not budget.exhausted:
-        edge_rows = _call(tool_usage, budget, "collector", "explore.fetch_call_edges", client.explore_fetch_call_edges, symbol=symbol, direction="both", candidate_file_keys=candidates, excluded_file_keys=deleted, limit=budget.max_fetch_limit, analysis_context=analysis_context)
+        edge_rows = _call(
+            tool_usage,
+            budget,
+            "collector",
+            "explore.fetch_call_edges",
+            client.explore_fetch_call_edges,
+            symbol=symbol,
+            direction="both",
+            candidate_file_keys=candidates,
+            excluded_file_keys=deleted,
+            limit=budget.max_fetch_limit,
+            analysis_context=analysis_context,
+        )
 
     conf: dict[str, Any] = {}
     if not budget.exhausted:
-        conf = _call(tool_usage, budget, "collector", "explore.get_confidence", client.explore_get_confidence, verified_files=sorted(set(fresh + parsed_keys)), stale_files=sorted(set(parse_failed)), unparsed_files=sorted(set(unparsed + list(parsed.get("unparsed_file_keys", []) or []))), warnings=[], overlay_mode=str(freshness.get("overlay_mode", "sparse")))
+        conf = _call(
+            tool_usage,
+            budget,
+            "collector",
+            "explore.get_confidence",
+            client.explore_get_confidence,
+            verified_files=sorted(set(fresh + parsed_keys)),
+            stale_files=sorted(set(parse_failed)),
+            unparsed_files=sorted(set(unparsed + list(parsed.get("unparsed_file_keys", []) or []))),
+            warnings=[],
+            overlay_mode=str(freshness.get("overlay_mode", "sparse")),
+        )
 
     macro_summary = ""
-    if not budget.exhausted and not list(ref_rows.get("references", []) or []) and not list(edge_rows.get("edges", []) or []):
+    macro_warning = ""
+    if (
+        not budget.exhausted
+        and candidates
+        and not list(sym_rows.get("symbols", []) or [])
+        and not list(ref_rows.get("references", []) or [])
+        and not list(edge_rows.get("edges", []) or [])
+    ):
         macro = _call(
             tool_usage,
             budget,
@@ -1049,8 +1358,21 @@ def _collect_symbol(
             "agent.investigate_symbol",
             client.agent_investigate_symbol,
             symbol=symbol,
+            analysis_context=analysis_context,
+            candidate_file_keys=candidates,
         )
-        macro_summary = str(macro.get("summary_markdown", "") or macro.get("summary", ""))
+        metrics = dict(macro.get("metrics", {}) or {})
+        file_paths = list(macro.get("file_paths", []) or [])
+        if (
+            int(metrics.get("total_candidates", 0) or 0) == 0
+            and int(metrics.get("definition_count", 0) or 0) == 0
+            and int(metrics.get("reference_count", 0) or 0) == 0
+            and int(metrics.get("call_edge_count", 0) or 0) == 0
+            and not file_paths
+        ):
+            macro_warning = "macro_fallback_empty"
+        else:
+            macro_summary = str(macro.get("summary_markdown", "") or macro.get("summary", ""))
 
     warnings = sorted(
         set(
@@ -1060,7 +1382,8 @@ def _collect_symbol(
             + list(sym_rows.get("warnings", []) or [])
             + list(ref_rows.get("warnings", []) or [])
             + list(edge_rows.get("warnings", []) or [])
-            + (["candidates_truncated"] if len(rg_candidates + listed_candidates) > len(candidates) else [])
+            + ([macro_warning] if macro_warning else [])
+            + (["candidates_truncated"] if candidates_truncated else [])
             + (["macro_fallback_used"] if macro_summary else [])
             + ([f"retrieval_scope:{selected_stage_name}"] if selected_stage_name else [])
             + (["budget_exhausted_mid_symbol"] if budget.exhausted else [])
@@ -1081,37 +1404,14 @@ def _collect_symbol(
         rg_hits=rg_hits[:200],
         read_contexts=read_contexts[:20],
         confidence=dict(conf.get("confidence", {}) or {}),
+        candidate_provenance=sorted(set(candidate_provenance)),
+        retrieval_status=_determine_retrieval_status(
+            candidates=candidates,
+            candidate_provenance=candidate_provenance,
+            warnings=warnings,
+        ),
         macro_summary=macro_summary[:2000],
         warnings=warnings,
-    )
-
-
-def _empty_impact(
-    symbol: str,
-    *,
-    rg_hits: list[dict[str, Any]] | None = None,
-    candidates: list[str] | None = None,
-    deleted: list[str] | None = None,
-    read_contexts: list[dict[str, Any]] | None = None,
-    fresh: list[str] | None = None,
-    stale: list[str] | None = None,
-    unparsed: list[str] | None = None,
-    parsed_keys: list[str] | None = None,
-    parse_failed: list[str] | None = None,
-) -> SymbolImpact:
-    """Build a partial SymbolImpact when budget is exhausted mid-symbol."""
-    return SymbolImpact(
-        symbol=symbol,
-        candidate_file_keys=candidates or [],
-        deleted_file_keys=deleted or [],
-        fresh=fresh or [],
-        stale=stale or [],
-        unparsed=unparsed or [],
-        parsed_file_keys=parsed_keys or [],
-        parse_failed_file_keys=parse_failed or [],
-        rg_hits=(rg_hits or [])[:200],
-        read_contexts=(read_contexts or [])[:20],
-        warnings=["budget_exhausted_mid_symbol"],
     )
 
 
@@ -1123,7 +1423,8 @@ def _discover_candidates_for_stage(
     tool_usage: list[ToolCallRecord],
     budget: BudgetTracker,
     stage: RetrievalStage,
-) -> tuple[list[dict[str, Any]], list[str], list[str], list[str]]:
+    bootstrap_file_keys: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[str], list[str], list[str], list[str]]:
     scope = {
         "entry_repos": stage.entry_repos,
         "max_repo_hops": stage.max_repo_hops,
@@ -1146,7 +1447,7 @@ def _discover_candidates_for_stage(
     )
     rg_hits = list(rg.get("hits", []) or [])
     if budget.exhausted:
-        return rg_hits, [], [], list(rg.get("warnings", []) or [])
+        return rg_hits, [], [], list(rg.get("warnings", []) or []), []
 
     listed = _call(
         tool_usage,
@@ -1160,12 +1461,21 @@ def _discover_candidates_for_stage(
         entry_repos=stage.entry_repos,
         max_repo_hops=stage.max_repo_hops,
         path_prefixes=stage.path_prefixes,
+        bootstrap_file_keys=bootstrap_file_keys,
         analysis_context=analysis_context,
     )
     stage_listed = list(listed.get("candidates", []) or [])
     stage_deleted = list(listed.get("deleted_file_keys", []) or [])
+    provenance_sources = sorted(
+        {
+            str(source)
+            for row in listed.get("provenance", []) or []
+            for source in list(row.get("sources", []) or [])
+            if str(source).strip()
+        }
+    )
     warnings = list(rg.get("warnings", []) or []) + list(listed.get("warnings", []) or [])
-    return rg_hits, stage_listed, stage_deleted, warnings
+    return rg_hits, stage_listed, stage_deleted, warnings, provenance_sources
 
 
 def _merge_rg_hits(existing: list[dict[str, Any]], new_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1232,6 +1542,441 @@ def _normalize_bundle_and_scope_repos(
         }
     )
     return updated_bundle, sorted(changed_repo_ids), warnings
+
+
+def _bootstrap_changed_file_semantics(
+    *,
+    client,
+    workspace: dict[str, Any],
+    changes,
+    prepass,
+    entry_repos: list[str],
+    analysis_context: dict[str, Any],
+    tool_usage: list[ToolCallRecord],
+    budget: BudgetTracker,
+) -> BootstrapContext:
+    workspace_root = str(workspace.get("root_path", "") or "").strip()
+    manifest_path = str(workspace.get("manifest_path", "") or "").strip()
+    empty = BootstrapContext(
+        changed_file_keys=[],
+        changed_file_keys_by_repo={},
+        changed_file_keys_by_path={},
+        raw_changed_declarations=list(prepass.changed_declarations),
+        semantic_changed_declarations=[],
+        bootstrap_seed_map={},
+        verified_files=[],
+        stale_files=[],
+        unparsed_files=[],
+        warnings=[],
+        bootstrap_seeded_symbols=[],
+    )
+    if not workspace_root or not manifest_path:
+        return empty
+
+    try:
+        manifest = load_workspace_manifest(manifest_path)
+    except Exception as exc:
+        return empty.model_copy(update={"warnings": [f"manifest_load_failed:{exc}"]})
+
+    changed_line_ranges = _changed_line_ranges_by_file(changes)
+    changed_file_keys_by_path: dict[str, str] = {}
+    changed_file_keys_by_repo: dict[str, list[str]] = defaultdict(list)
+    warnings: list[str] = []
+    preferred_repo_set = set(entry_repos)
+
+    for path in prepass.changed_files:
+        file_key = resolve_file_key(changed_path=path, workspace_root=workspace_root, manifest=manifest)
+        if not file_key:
+            file_key = _guess_changed_file_key(
+                changed_path=path,
+                manifest=manifest,
+                preferred_repos=entry_repos,
+            )
+        if not file_key:
+            warnings.append(f"changed_file_unresolved:{path}")
+            continue
+        repo_id = repo_for_file_key(file_key)
+        if preferred_repo_set and repo_id not in preferred_repo_set:
+            continue
+        changed_file_keys_by_path[path] = file_key
+        if file_key not in changed_file_keys_by_repo[repo_id]:
+            changed_file_keys_by_repo[repo_id].append(file_key)
+
+    changed_file_keys = _dedupe_file_keys(
+        [file_key for keys in changed_file_keys_by_repo.values() for file_key in keys]
+    )
+    semantic_changed_declarations: list[ChangedDeclaration] = []
+    verified_files: list[str] = []
+    stale_files: list[str] = []
+    unparsed_files: list[str] = []
+
+    for path, file_key in changed_file_keys_by_path.items():
+        if budget.exhausted:
+            warnings.append("bootstrap_budget_exhausted")
+            break
+        response = _call(
+            tool_usage,
+            budget,
+            "collector",
+            "query.file_symbols",
+            client.query_file_symbols,
+            file_key=file_key,
+            analysis_context=analysis_context,
+        )
+        confidence = dict(response.get("confidence", {}) or {})
+        verified_files.extend(str(x) for x in confidence.get("verified_files", []) or [])
+        stale_files.extend(str(x) for x in confidence.get("stale_files", []) or [])
+        unparsed_files.extend(str(x) for x in confidence.get("unparsed_files", []) or [])
+        warnings.extend(str(x) for x in confidence.get("warnings", []) or [])
+        warnings.extend(str(x) for x in response.get("warnings", []) or [])
+        semantic_changed_declarations.extend(
+            _semantic_declarations_from_file_symbols(
+                file_path=path,
+                symbol_rows=list(response.get("symbols", []) or []),
+                changed_ranges=changed_line_ranges.get(path, []),
+            )
+        )
+
+    semantic_changed_declarations = _dedupe_changed_declarations(semantic_changed_declarations)
+    bootstrap_seed_map, bootstrap_seeded_symbols = _build_bootstrap_seed_map(
+        prepass=prepass,
+        changed_file_keys_by_path=changed_file_keys_by_path,
+        semantic_changed_declarations=semantic_changed_declarations,
+    )
+    return BootstrapContext(
+        changed_file_keys=changed_file_keys,
+        changed_file_keys_by_repo={repo_id: list(keys) for repo_id, keys in changed_file_keys_by_repo.items()},
+        changed_file_keys_by_path=changed_file_keys_by_path,
+        raw_changed_declarations=list(prepass.changed_declarations),
+        semantic_changed_declarations=semantic_changed_declarations,
+        bootstrap_seed_map=bootstrap_seed_map,
+        verified_files=sorted(set(verified_files)),
+        stale_files=sorted(set(stale_files)),
+        unparsed_files=sorted(set(unparsed_files)),
+        warnings=sorted(set(warnings)),
+        bootstrap_seeded_symbols=bootstrap_seeded_symbols,
+    )
+
+
+def _guess_changed_file_key(
+    *,
+    changed_path: str,
+    manifest,
+    preferred_repos: list[str],
+) -> str:
+    normalized = str(changed_path or "").replace("\\", "/").strip().lstrip("/")
+    if normalized.startswith("a/") or normalized.startswith("b/"):
+        normalized = normalized[2:]
+    preferred = list(dict.fromkeys([repo_id for repo_id in preferred_repos if repo_id in manifest.repo_map()]))
+    if len(preferred) != 1:
+        return ""
+    repo_cfg = manifest.repo_map()[preferred[0]]
+    root = str(repo_cfg.root or "").replace("\\", "/").strip().strip("/")
+    rel_path = normalized
+    if root and (normalized == root or normalized.startswith(root + "/")):
+        rel_path = normalized[len(root) :].lstrip("/")
+    return f"{repo_cfg.repo_id}:{rel_path}" if rel_path else ""
+
+
+def _changed_line_ranges_by_file(changes) -> dict[str, list[tuple[int, int]]]:
+    ranges: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for change in changes:
+        path = change.effective_path
+        if not path:
+            continue
+        for hunk in change.hunks:
+            if hunk.new_count > 0:
+                start = int(hunk.new_start)
+                end = int(hunk.new_start + max(hunk.new_count, 1) - 1)
+            elif hunk.old_count > 0:
+                start = int(hunk.old_start)
+                end = int(hunk.old_start + max(hunk.old_count, 1) - 1)
+            else:
+                continue
+            ranges[path].append((start, end))
+    return ranges
+
+
+def _semantic_declarations_from_file_symbols(
+    *,
+    file_path: str,
+    symbol_rows: list[dict[str, Any]],
+    changed_ranges: list[tuple[int, int]],
+) -> list[ChangedDeclaration]:
+    declarations: list[ChangedDeclaration] = []
+    for row in symbol_rows:
+        line = int(row.get("line", 0) or 0)
+        if line <= 0:
+            continue
+        end_line = int(row.get("extent_end_line", 0) or line)
+        if changed_ranges and not _intersects_changed_range(line, end_line, changed_ranges):
+            continue
+        symbol_name = str(row.get("qualified_name", "") or row.get("name", "")).strip()
+        if not symbol_name:
+            continue
+        kind = _symbol_kind_from_backend_kind(str(row.get("kind", "")), symbol_name)
+        if kind is None:
+            continue
+        declarations.append(
+            ChangedDeclaration(
+                symbol=symbol_name,
+                container=symbol_name.rsplit("::", 1)[0] if "::" in symbol_name else "",
+                kind=kind,
+                file_path=file_path,
+                line=line,
+            )
+        )
+    return _dedupe_changed_declarations(declarations)
+
+
+def _symbol_kind_from_backend_kind(kind: str, symbol_name: str) -> str | None:
+    lowered = kind.strip().lower()
+    if not lowered:
+        return "method" if "::" in symbol_name else "function"
+    if "constructor" in lowered:
+        return "constructor"
+    if "destructor" in lowered:
+        return "destructor"
+    if "enum" in lowered:
+        return "enum"
+    if "struct" in lowered:
+        return "struct"
+    if "class" in lowered or "record" in lowered:
+        return "class"
+    if "method" in lowered:
+        return "method"
+    if "function" in lowered:
+        return "method" if "::" in symbol_name else "function"
+    return None
+
+
+def _intersects_changed_range(line: int, end_line: int, ranges: list[tuple[int, int]]) -> bool:
+    if line <= 0:
+        return False
+    span_end = max(line, end_line or line)
+    for start, end in ranges:
+        if line <= end and span_end >= start:
+            return True
+    return False
+
+
+def _dedupe_changed_declarations(declarations: list[ChangedDeclaration]) -> list[ChangedDeclaration]:
+    out: list[ChangedDeclaration] = []
+    seen: set[tuple[str, str, int]] = set()
+    for decl in sorted(declarations, key=lambda row: (row.file_path, row.line, row.symbol)):
+        key = (decl.file_path, decl.symbol, decl.line)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(decl)
+    return out
+
+
+def _build_bootstrap_seed_map(
+    *,
+    prepass,
+    changed_file_keys_by_path: dict[str, str],
+    semantic_changed_declarations: list[ChangedDeclaration],
+) -> tuple[dict[str, list[str]], list[dict[str, Any]]]:
+    seed_files: dict[str, list[str]] = defaultdict(list)
+    seed_reasons: dict[str, set[str]] = defaultdict(set)
+
+    def _add(symbol: str, file_key: str, reason: str) -> None:
+        text = str(symbol or "").strip()
+        key = str(file_key or "").strip()
+        if not text or not key:
+            return
+        if key not in seed_files[text]:
+            seed_files[text].append(key)
+        seed_reasons[text].add(reason)
+
+    for decl in semantic_changed_declarations:
+        file_key = changed_file_keys_by_path.get(decl.file_path, "")
+        _add(decl.symbol, file_key, "semantic_declaration")
+        if decl.container:
+            _add(decl.container, file_key, "semantic_container")
+
+    for decl in prepass.changed_declarations:
+        file_key = changed_file_keys_by_path.get(decl.file_path, "")
+        _add(decl.symbol, file_key, "lexical_declaration")
+        if decl.container:
+            _add(decl.container, file_key, "lexical_container")
+
+    for seed in prepass.seed_symbols:
+        if seed.relevance_tier == "generic_fallback" and not any(
+            reason.startswith("changed_declaration:") or reason == "qualified_occurrence"
+            for reason in seed.reasons
+        ):
+            continue
+        for path in seed.file_paths:
+            file_key = changed_file_keys_by_path.get(path, "")
+            _add(seed.symbol, file_key, f"seed:{seed.relevance_tier}")
+            if seed.container:
+                _add(seed.container, file_key, "seed_container")
+
+    for call in prepass.member_call_sites:
+        file_key = changed_file_keys_by_path.get(call.file_path, "")
+        if call.container:
+            _add(call.container, file_key, "member_container")
+        if call.qualified_receiver_type:
+            _add(call.qualified_receiver_type, file_key, "qualified_receiver")
+
+    debug_rows = [
+        {
+            "symbol": symbol,
+            "file_keys": list(file_keys),
+            "reasons": sorted(seed_reasons.get(symbol, set())),
+        }
+        for symbol, file_keys in sorted(seed_files.items())
+    ]
+    return {symbol: list(file_keys) for symbol, file_keys in seed_files.items()}, debug_rows[:120]
+
+
+def _apply_semantic_prepass_enrichment(prepass, bootstrap: BootstrapContext):
+    if not bootstrap.semantic_changed_declarations:
+        return prepass
+
+    semantic_by_path: dict[str, list[ChangedDeclaration]] = defaultdict(list)
+    for decl in bootstrap.semantic_changed_declarations:
+        semantic_by_path[decl.file_path].append(decl)
+
+    raw_by_path: dict[str, list[ChangedDeclaration]] = defaultdict(list)
+    for decl in bootstrap.raw_changed_declarations:
+        raw_by_path[decl.file_path].append(decl)
+
+    final_declarations: list[ChangedDeclaration] = []
+    for path in prepass.changed_files:
+        if semantic_by_path.get(path):
+            final_declarations.extend(semantic_by_path[path])
+        else:
+            final_declarations.extend(raw_by_path.get(path, []))
+    final_declarations = _dedupe_changed_declarations(final_declarations)
+
+    changed_containers_set = {container for container in prepass.changed_containers if container}
+    changed_containers_set.update(
+        decl.container if decl.container else decl.symbol
+        for decl in final_declarations
+        if decl.kind in {"class", "struct", "enum"} or decl.container
+    )
+    changed_containers = sorted(changed_containers_set)
+    changed_methods = [
+        decl.symbol
+        for decl in final_declarations
+        if decl.kind in {"function", "method", "constructor", "destructor"}
+    ][:100]
+
+    return prepass.model_copy(
+        update={
+            "changed_declarations": final_declarations[:200],
+            "changed_containers": changed_containers,
+            "changed_methods": changed_methods,
+            "seed_symbols": _reconcile_seed_symbols(prepass.seed_symbols, final_declarations),
+        }
+    )
+
+
+def _reconcile_seed_symbols(seed_symbols: list[SeedSymbol], declarations: list[ChangedDeclaration]) -> list[SeedSymbol]:
+    retained: dict[str, SeedSymbol] = {
+        seed.symbol: seed
+        for seed in seed_symbols
+        if seed.relevance_tier != "declaration"
+    }
+    for decl in declarations:
+        existing = retained.get(decl.symbol)
+        reasons = sorted(
+            set((existing.reasons if existing else []) + [f"semantic_changed_declaration:{decl.kind}"])
+        )
+        retained[decl.symbol] = SeedSymbol(
+            symbol=decl.symbol,
+            source="declaration",
+            score=max(4.0, float(existing.score if existing else 0.0)),
+            relevance_tier="declaration",
+            reasons=reasons,
+            receiver=existing.receiver if existing else "",
+            container=decl.container or (existing.container if existing else ""),
+            file_paths=sorted(set((existing.file_paths if existing else []) + [decl.file_path])),
+        )
+    ranked = sorted(
+        retained.values(),
+        key=lambda seed: (
+            -float(seed.score),
+            0 if seed.relevance_tier == "declaration" else 1,
+            seed.symbol,
+        ),
+    )
+    return ranked[: max(1, len(seed_symbols), len(declarations))]
+
+
+def _bootstrap_file_keys_for_symbol(symbol: str, bootstrap: BootstrapContext | None) -> list[str]:
+    if bootstrap is None:
+        return []
+    direct = _dedupe_file_keys(list(bootstrap.bootstrap_seed_map.get(symbol, [])))
+    if direct:
+        return direct
+    if "::" in symbol:
+        container = symbol.rsplit("::", 1)[0]
+        container_keys = _dedupe_file_keys(list(bootstrap.bootstrap_seed_map.get(container, [])))
+        if container_keys:
+            return container_keys
+    if len(bootstrap.changed_file_keys_by_repo) == 1:
+        return _dedupe_file_keys(next(iter(bootstrap.changed_file_keys_by_repo.values())))
+    return list(bootstrap.changed_file_keys)
+
+
+def _symbol_confidence_from_impact(impact: SymbolImpact) -> SymbolConfidence:
+    conf = dict(impact.confidence or {})
+    return SymbolConfidence(
+        verified_ratio=float(conf.get("verified_ratio", 0.0) or 0.0),
+        total_candidates=int(conf.get("total_candidates", 0) or 0),
+        verified_files=sorted(str(x) for x in conf.get("verified_files", []) or []),
+        stale_files=sorted(str(x) for x in conf.get("stale_files", []) or []),
+        unparsed_files=sorted(str(x) for x in conf.get("unparsed_files", []) or []),
+        warnings=sorted(set(str(x) for x in impact.warnings)),
+        candidate_sources=sorted(set(impact.candidate_provenance)),
+        retrieval_status=impact.retrieval_status,
+    )
+
+
+def _impact_has_semantic_signal(impact: SymbolImpact) -> bool:
+    return bool(
+        impact.symbols
+        or impact.references
+        or impact.call_edges
+        or impact.macro_summary
+    )
+
+
+def _semantic_bootstrap_failed(*, bootstrap: BootstrapContext | None, fact_sheet: ReviewFactSheet) -> bool:
+    if bootstrap is None or not bootstrap.changed_file_keys:
+        return False
+    if bootstrap.verified_files:
+        return False
+    declaration_symbols = {decl.symbol for decl in fact_sheet.changed_declarations}
+    if not declaration_symbols:
+        return False
+    declaration_facts = [sf for sf in fact_sheet.symbol_facts if sf.symbol in declaration_symbols]
+    if not declaration_facts:
+        return False
+    return all(sf.confidence.retrieval_status == "empty" and not sf.candidate_file_keys for sf in declaration_facts)
+
+
+def _determine_retrieval_status(
+    *,
+    candidates: list[str],
+    candidate_provenance: list[str],
+    warnings: list[str],
+) -> str:
+    if any("_failed:" in str(warn) for warn in warnings):
+        return "failed"
+    if not candidates:
+        return "empty"
+    widening_used = any(
+        str(warn).startswith("retrieval_scope:") and str(warn) != "retrieval_scope:bootstrap"
+        for warn in warnings
+    )
+    if "bootstrap_seed" in set(candidate_provenance) and not widening_used:
+        return "bootstrapped"
+    return "expanded"
 
 
 def _fallback_prioritized_symbols(prepass, max_symbols: int) -> list[str]:
@@ -1518,8 +2263,9 @@ def _coverage(impacts: list[SymbolImpact]) -> CoverageSummary:
         conf = dict(impact.confidence or {})
         total = int(conf.get("total_candidates", 0) or 0)
         ratio = float(conf.get("verified_ratio", 0.0) or 0.0)
-        ratio_sum += ratio * max(total, 1)
-        weight += max(total, 1)
+        if total > 0:
+            ratio_sum += ratio * total
+            weight += total
         verified.update([str(x) for x in conf.get("verified_files", []) or []])
         stale.update([str(x) for x in conf.get("stale_files", []) or []])
         unparsed.update([str(x) for x in conf.get("unparsed_files", []) or []])

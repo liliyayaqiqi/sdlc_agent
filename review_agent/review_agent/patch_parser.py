@@ -66,6 +66,22 @@ _KEYWORDS = {
     "this",
 }
 
+_INVALID_DECLARATION_NAMES = {
+    "void",
+    "int",
+    "char",
+    "bool",
+    "float",
+    "double",
+    "short",
+    "long",
+    "signed",
+    "unsigned",
+    "size_t",
+    "ssize_t",
+    "auto",
+}
+
 _SYSTEM_FUNCTION_HINTS = {
     "CreateEvent",
     "CreateEventA",
@@ -331,7 +347,13 @@ def build_prepass_result(changes: list[PatchChange], *, max_symbols: int = 24) -
                 if _MACRO_RE.search(text):
                     include_macro_config_changes.add(f"macro:{path}")
 
-                declaration = _extract_declaration(text=text, file_path=path, line=location_line, active_container=active_container)
+                declaration = _extract_declaration(
+                    text=text,
+                    file_path=path,
+                    line=location_line,
+                    active_container=active_container,
+                    active_symbol=active_symbol,
+                )
                 if declaration is not None:
                     changed_declarations.append(declaration)
                     if declaration.container:
@@ -502,6 +524,7 @@ def _extract_declaration(
     file_path: str,
     line: int,
     active_container: str,
+    active_symbol: str = "",
 ) -> ChangedDeclaration | None:
     stripped = text.strip()
     if not stripped or stripped.startswith("//") or _INCLUDE_RE.match(stripped) or _MACRO_RE.match(stripped):
@@ -527,8 +550,19 @@ def _extract_declaration(
     symbol = match.group("name").strip()
     if not symbol or symbol in _KEYWORDS or symbol.startswith("std::"):
         return None
+    base_name = symbol.split("::")[-1].lstrip("~")
+    if base_name in _INVALID_DECLARATION_NAMES:
+        return None
     prefix_text = prefix.strip()
     container = _container_from_symbol(symbol)
+    if (
+        _is_implementation_file(file_path)
+        and stripped.endswith(";")
+        and "::" not in symbol
+    ):
+        in_type_body = bool(active_container and (not active_symbol or active_symbol == active_container))
+        if not in_type_body:
+            return None
     base_name = symbol.split("::")[-1]
     if " " not in prefix_text:
         active_tail = active_container.split("::")[-1] if active_container else ""
@@ -851,6 +885,10 @@ def _is_config_file(path: str) -> bool:
     if p.name in {"CMakeLists.txt", "BUILD", "BUILD.bazel"}:
         return True
     return p.suffix.lower() in _CONFIG_EXTENSIONS
+
+
+def _is_implementation_file(path: str) -> bool:
+    return PurePosixPath(path).suffix.lower() in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
 
 
 def _is_low_entropy_symbol(symbol: str) -> bool:

@@ -74,6 +74,22 @@ def finalize_report(
             )
         )
 
+    semantic_bootstrap_failed = "semantic_bootstrap_failed" in set(fact_sheet.warnings)
+    if semantic_bootstrap_failed:
+        findings.append(
+            ReviewFinding(
+                id=f"bootstrap-failed-{workspace_id}",
+                severity=Severity.HIGH,
+                category=FindingCategory.CONFIDENCE_GAP,
+                title="Semantic bootstrap failed for changed files",
+                impact="The review could not bootstrap semantic verification from the changed files, so findings may be incomplete.",
+                recommendation="Verify changed files are resolvable and parseable in the head context, then rerun the review.",
+                evidence=[EvidenceRef(tool="policy_gate", description="semantic_bootstrap_failed")],
+                confidence=0.98,
+                tags=["semantic_bootstrap_failed"],
+            )
+        )
+
     if fact_sheet.merge_analysis_degraded:
         findings.append(
             ReviewFinding(
@@ -92,14 +108,22 @@ def finalize_report(
     findings = sorted(findings, key=lambda f: (-SEVERITY_RANK[f.severity], f.title, f.id))
     blocking = len([f for f in findings if SEVERITY_RANK[f.severity] >= SEVERITY_RANK[fail_threshold]])
     exec_status = ReviewExecutionStatus.BLOCK if blocking > 0 else ReviewExecutionStatus.PASS
+    indeterminate_reason = ""
+    should_block = blocking > 0
+    if semantic_bootstrap_failed:
+        exec_status = ReviewExecutionStatus.INDETERMINATE
+        indeterminate_reason = "semantic_bootstrap_failed"
+        should_block = True
     summary = draft.summary.strip() or f"Reviewed {len(fact_sheet.changed_files)} files; findings={len(findings)}."
+    if semantic_bootstrap_failed and "semantic bootstrap" not in summary.lower():
+        summary = f"{summary} Semantic bootstrap failed for the changed files, so verification coverage is incomplete."
 
     decision = ReviewDecision(
         fail_threshold=fail_threshold,
         blocking_findings=blocking,
-        should_block=blocking > 0,
+        should_block=should_block,
         execution_status=exec_status,
-        indeterminate_reason="",
+        indeterminate_reason=indeterminate_reason,
         review_confidence=_confidence_for_fact_sheet(fact_sheet),
     )
 

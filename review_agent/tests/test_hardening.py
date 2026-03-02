@@ -93,7 +93,7 @@ class _NullClient:
         return {"hits": []}
 
     def explore_list_candidates(self, **kw):
-        return {"candidates": []}
+        return {"candidates": [], "provenance": []}
 
     def explore_classify_freshness(self, **kw):
         return {"stale": [], "fresh": [], "unparsed": [], "overlay_mode": "dense"}
@@ -115,6 +115,9 @@ class _NullClient:
 
     def explore_read_file(self, **kw):
         return {"content": ""}
+
+    def query_file_symbols(self, **kw):
+        return {"symbols": [], "confidence": {"verified_ratio": 0.0, "total_candidates": 0}}
 
     def agent_investigate_symbol(self, **kw):
         return {"summary_markdown": ""}
@@ -158,6 +161,59 @@ class _ScopedClient(_NullClient):
     def explore_list_candidates(self, **kw):
         self.list_calls.append(kw)
         return {"candidates": []}
+
+
+class _BootstrapCandidateClient(_NullClient):
+    def explore_list_candidates(self, **kw):
+        seeded = list(kw.get("bootstrap_file_keys", []) or [])
+        return {
+            "candidates": seeded,
+            "deleted_file_keys": [],
+            "provenance": [{"file_key": file_key, "sources": ["bootstrap_seed"]} for file_key in seeded],
+        }
+
+    def explore_classify_freshness(self, **kw):
+        files = list(kw.get("candidate_file_keys", []) or [])
+        return {"stale": [], "fresh": files, "unparsed": [], "overlay_mode": "dense"}
+
+    def explore_fetch_symbols(self, **kw):
+        files = list(kw.get("candidate_file_keys", []) or [])
+        return {"symbols": [{"file_key": files[0], "line": 10}]} if files else {"symbols": []}
+
+    def explore_get_confidence(self, **kw):
+        verified = list(kw.get("verified_files", []) or [])
+        return {
+            "confidence": {
+                "verified_ratio": 1.0 if verified else 0.0,
+                "total_candidates": len(verified),
+                "verified_files": verified,
+                "stale_files": [],
+                "unparsed_files": [],
+            }
+        }
+
+
+class _EmptyMacroClient(_BootstrapCandidateClient):
+    def explore_fetch_symbols(self, **kw):
+        return {"symbols": []}
+
+    def explore_fetch_references(self, **kw):
+        return {"references": []}
+
+    def explore_fetch_call_edges(self, **kw):
+        return {"edges": []}
+
+    def agent_investigate_symbol(self, **kw):
+        return {
+            "summary_markdown": "empty",
+            "metrics": {
+                "total_candidates": 0,
+                "definition_count": 0,
+                "reference_count": 0,
+                "call_edge_count": 0,
+            },
+            "file_paths": [],
+        }
 
 
 class TestBudgetExhaustion:
@@ -205,6 +261,39 @@ class TestBudgetExhaustion:
         assert client.list_calls[0]["entry_repos"] == ["repoA"]
         assert client.list_calls[0]["max_repo_hops"] == 0
         assert client.list_calls[0]["path_prefixes"] == ["src/module"]
+
+    def test_collect_symbol_bootstraps_candidates_without_recall(self):
+        impact = _collect_symbol(
+            _BootstrapCandidateClient(),
+            None,
+            {"mode": "pr", "context_id": "ctx"},
+            "ScopedSymbol",
+            [],
+            _budget(calls=20),
+            bootstrap_file_keys=["repoA:src/module/new_file.cpp"],
+            retrieval_stages=[
+                RetrievalStage(name="exact_paths", entry_repos=["repoA"], max_repo_hops=0, path_prefixes=["src/module"])
+            ],
+        )
+        assert impact.candidate_file_keys == ["repoA:src/module/new_file.cpp"]
+        assert impact.retrieval_status == "bootstrapped"
+        assert "bootstrap_seed" in impact.candidate_provenance
+
+    def test_empty_macro_fallback_is_not_treated_as_semantic_evidence(self):
+        impact = _collect_symbol(
+            _EmptyMacroClient(),
+            None,
+            {"mode": "pr", "context_id": "ctx"},
+            "ScopedSymbol",
+            [],
+            _budget(calls=20),
+            bootstrap_file_keys=["repoA:src/module/new_file.cpp"],
+            retrieval_stages=[
+                RetrievalStage(name="exact_paths", entry_repos=["repoA"], max_repo_hops=0, path_prefixes=["src/module"])
+            ],
+        )
+        assert impact.macro_summary == ""
+        assert "macro_fallback_empty" in impact.warnings
 
 
 class TestRepoScoping:
@@ -408,6 +497,31 @@ class TestMergeAndPolicy:
         assert final.decision.execution_status == ReviewExecutionStatus.PASS
         assert final.decision.review_confidence == "low"
         assert any(f.category == FindingCategory.CONFIDENCE_GAP for f in final.findings)
+
+    def test_policy_gate_semantic_bootstrap_failure_is_indeterminate(self):
+        report = ReviewReport(
+            workspace_id="ws",
+            summary="",
+            findings=[],
+            coverage=CoverageSummary(),
+            decision=ReviewDecision(fail_threshold=Severity.HIGH, blocking_findings=0, should_block=False),
+        )
+        fact_sheet = ReviewFactSheet(
+            changed_files=["src/app.cpp"],
+            warnings=["semantic_bootstrap_failed"],
+            coverage=CoverageSummary(verified_ratio=0.0),
+        )
+        final = _policy_gate(
+            report=report,
+            fact_sheet=fact_sheet,
+            test_impact=ReviewTestImpact(),
+            fail_threshold=Severity.HIGH,
+            tool_usage=[],
+            workspace_id="ws",
+        )
+        assert final.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert final.decision.indeterminate_reason == "semantic_bootstrap_failed"
+        assert any("semantic_bootstrap_failed" in finding.tags for finding in final.findings)
 
     def test_indeterminate_report_has_low_confidence(self):
         report = _indeterminate_report(

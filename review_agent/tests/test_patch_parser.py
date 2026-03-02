@@ -119,3 +119,32 @@ def test_build_prepass_result_distinguishes_declarations_from_member_calls():
     assert "Controller::Run" in prepass.changed_methods
     assert "foo.bar" in prepass.added_call_sites
     assert all(decl.symbol != "bar" for decl in prepass.changed_declarations)
+
+
+def test_build_prepass_result_rejects_lock_guard_statement_as_declaration():
+    patch = """diff --git a/src/controller.cpp b/src/controller.cpp
+--- a/src/controller.cpp
++++ b/src/controller.cpp
+@@ -1 +1,3 @@
++void Run() {
++  std::lock_guard<std::mutex> lock(mu_);
++}
+ """
+    changes = parse_unified_diff(patch)
+    prepass = build_prepass_result(changes, max_symbols=12)
+    assert all(decl.symbol != "lock" and not decl.symbol.endswith("::lock") for decl in prepass.changed_declarations)
+
+
+def test_build_prepass_result_rejects_primitive_type_as_declaration_symbol():
+    patch = """diff --git a/src/controller.cpp b/src/controller.cpp
+--- a/src/controller.cpp
++++ b/src/controller.cpp
+@@ -1 +1,4 @@
++void Run();
++int Count();
++bool Ready();
++char Mode();
+ """
+    changes = parse_unified_diff(patch)
+    prepass = build_prepass_result(changes, max_symbols=12)
+    assert "void" not in {decl.symbol for decl in prepass.changed_declarations}

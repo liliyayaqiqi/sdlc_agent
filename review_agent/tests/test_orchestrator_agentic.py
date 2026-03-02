@@ -23,7 +23,11 @@ class _FakeClient:
         return {"hits": [{"file_key": "repoA:src/app.cpp", "line": 3, "line_text": "doLogin();"}]}
 
     def explore_list_candidates(self, **kw):
-        return {"candidates": ["repoA:src/app.cpp"], "deleted_file_keys": []}
+        return {
+            "candidates": ["repoA:src/app.cpp"],
+            "deleted_file_keys": [],
+            "provenance": [{"file_key": "repoA:src/app.cpp", "sources": ["bootstrap_seed"]}],
+        }
 
     def explore_classify_freshness(self, **kw):
         files = list(kw.get("candidate_file_keys", []) or [])
@@ -50,6 +54,12 @@ class _FakeClient:
                 "stale_files": list(kw.get("stale_files", []) or []),
                 "unparsed_files": list(kw.get("unparsed_files", []) or []),
             }
+        }
+
+    def query_file_symbols(self, **kw):
+        return {
+            "symbols": [{"file_key": kw.get("file_key", ""), "qualified_name": "repoA::doLogin", "kind": "Function", "line": 2}],
+            "confidence": {"verified_ratio": 1.0, "total_candidates": 1, "verified_files": [kw.get("file_key", "")]},
         }
 
     def explore_read_file(self, **kw):

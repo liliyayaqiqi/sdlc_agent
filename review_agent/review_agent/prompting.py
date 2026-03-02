@@ -277,11 +277,24 @@ def build_synthesis_prompt(*, fact_sheet: ReviewFactSheet, fail_threshold: str) 
         "fail_threshold": fail_threshold,
         "view_contexts": view_summary,
         "fact_sheet": fact_sheet.model_dump(mode="json"),
+        "symbol_confidence": [
+            {
+                "symbol": sf.symbol,
+                "verified_ratio": sf.confidence.verified_ratio,
+                "total_candidates": sf.confidence.total_candidates,
+                "retrieval_status": sf.confidence.retrieval_status,
+                "candidate_provenance": sf.candidate_provenance,
+                "warnings": sf.warnings[:6],
+            }
+            for sf in fact_sheet.symbol_facts[:40]
+        ],
     }
 
     sections = [
         "Generate final review findings and summary from this fact sheet.",
         "Use categories: hidden_side_effect, cross_repo_breakage, architecture_risk, confidence_gap.",
+        "Treat empty candidate retrieval, failed retrieval, and macro-only evidence as confidence gaps unless direct changed-line evidence is strong and local.",
+        "Use confidence=0.0 only for purely speculative concerns. Evidence anchored in changed local code should usually be >= 0.3 even under partial semantic coverage.",
     ]
 
     if merge_signals:
@@ -320,6 +333,8 @@ def build_exploration_prompt(
     high_delta_symbols: list[str] = []
 
     for sf in fact_sheet.symbol_facts:
+        if sf.confidence.verified_ratio < 0.4 or sf.confidence.retrieval_status in {"empty", "failed"}:
+            low_confidence_symbols.append(sf.symbol)
         if "macro_fallback_used" in sf.warnings:
             macro_fallback_symbols.append(sf.symbol)
         if abs(sf.reference_delta_vs_baseline) >= 3 or abs(sf.call_edge_delta_vs_baseline) >= 3:
@@ -356,10 +371,11 @@ def build_exploration_prompt(
         "Perform targeted follow-up investigation to fill evidence gaps.",
         f"You have {remaining_calls} tool calls and {remaining_rounds} rounds remaining.",
         "Focus on: (1) symbols that fell back to macro investigation, "
-        "(2) high-delta symbols with large reference/edge changes, "
-        "(3) uncovered suspicious anchors (concurrency, lifetime, exception, ABI).",
+        "(2) low-confidence or empty-retrieval symbols, "
+        "(3) high-delta symbols with large reference/edge changes, "
+        "(4) uncovered suspicious anchors (concurrency, lifetime, exception, ABI).",
         "Do NOT re-investigate symbols that already have good evidence.",
-        "Return a text summary of your findings when done.",
+        "Return an ExplorationResult only.",
     ]
 
     sections.append(json.dumps(payload, indent=2, ensure_ascii=True))
