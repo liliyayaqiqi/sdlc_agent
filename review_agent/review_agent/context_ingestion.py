@@ -36,6 +36,54 @@ class IngestedReviewContext(BaseModel):
     enable_cache: bool
     cache_dir: str
 
+    @property
+    def workspace_id(self) -> str:
+        return self.bundle.workspace_id
+
+    @property
+    def patch_text(self) -> str:
+        return self.bundle.patch_text
+
+    @property
+    def changed_files(self) -> list[str]:
+        return self.bundle.changed_files
+
+    @property
+    def workspace_fingerprint(self) -> str:
+        return self.bundle.workspace_fingerprint
+
+    @property
+    def primary_repo_id(self) -> str:
+        return self.bundle.primary_repo_id
+
+    @property
+    def per_repo_shas(self) -> dict[str, str]:
+        return self.bundle.per_repo_shas
+
+    @property
+    def repo_revisions(self) -> list[RepoRevisionContext]:
+        return self.bundle.repo_revisions
+
+    @property
+    def base_sha(self) -> str:
+        return self.bundle.base_sha
+
+    @property
+    def head_sha(self) -> str:
+        return self.bundle.head_sha
+
+    @property
+    def target_branch_head_sha(self) -> str:
+        return self.bundle.target_branch_head_sha
+
+    @property
+    def merge_preview_sha(self) -> str:
+        return self.bundle.merge_preview_sha
+
+    @property
+    def pr_metadata(self) -> dict[str, object]:
+        return self.bundle.pr_metadata
+
 
 class ReviewContextIngestor:
     """Transforms request payloads into a single context-driven runtime model."""

@@ -69,10 +69,25 @@ class CxxtractHttpClient:
             self._http = httpx.Client(timeout=self.timeout_s)
         return self._http
 
+    def _resolve_workspace_id(
+        self,
+        *,
+        workspace_id: str = "",
+        analysis_context: dict[str, Any] | None = None,
+    ) -> str:
+        if workspace_id.strip():
+            return workspace_id.strip()
+        if isinstance(analysis_context, dict):
+            context_workspace_id = str(analysis_context.get("workspace_id", "") or "").strip()
+            if context_workspace_id:
+                return context_workspace_id
+        return self.workspace_id
+
     # -- public API --------------------------------------------------------
 
-    def workspace_info(self) -> dict[str, Any]:
-        return self._get(f"/workspace/{quote(self.workspace_id, safe='')}")
+    def workspace_info(self, *, workspace_id: str = "") -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id)
+        return self._get(f"/workspace/{quote(resolved_workspace_id, safe='')}")
 
     def context_create_pr_overlay(
         self,
@@ -103,9 +118,11 @@ class CxxtractHttpClient:
         commit_sha: str,
         branch: str = "",
         force_clean: bool = True,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id)
         return self._post(
-            f"/workspace/{quote(self.workspace_id, safe='')}/sync-repo",
+            f"/workspace/{quote(resolved_workspace_id, safe='')}/sync-repo",
             {
                 "repo_id": repo_id,
                 "commit_sha": commit_sha,
@@ -114,14 +131,49 @@ class CxxtractHttpClient:
             },
         )
 
+    def materialize_review_workspaces(
+        self,
+        *,
+        review_key: str,
+        repo_revisions: list[dict[str, Any]],
+        views: list[str],
+        ttl_s: int = 24 * 3600,
+        reuse_policy: str = "reuse_if_fresh",
+        force_refresh_artifacts: bool = False,
+        artifact_overrides: dict[str, Any] | None = None,
+        workspace_id: str = "",
+    ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id)
+        return self._post(
+            f"/workspace/{quote(resolved_workspace_id, safe='')}/materialize-review",
+            {
+                "workspace_id": resolved_workspace_id,
+                "review_key": review_key,
+                "repo_revisions": repo_revisions,
+                "views": views,
+                "ttl_s": ttl_s,
+                "reuse_policy": reuse_policy,
+                "force_refresh_artifacts": bool(force_refresh_artifacts),
+                "artifact_overrides": artifact_overrides or {},
+            },
+        )
+
+    def get_review_materialization_status(self, *, materialization_id: str) -> dict[str, Any]:
+        return self._get(f"/review-materializations/{quote(materialization_id, safe='')}")
+
+    def expire_review_materialization(self, *, materialization_id: str) -> dict[str, Any]:
+        return self._post(f"/review-materializations/{quote(materialization_id, safe='')}/expire", {})
+
     def agent_investigate_symbol(
         self,
         *,
         symbol: str,
         analysis_context: dict[str, Any] | None = None,
         candidate_file_keys: list[str] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"workspace_id": self.workspace_id, "symbol": symbol}
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
+        body: dict[str, Any] = {"workspace_id": resolved_workspace_id, "symbol": symbol}
         if analysis_context:
             body["analysis_context"] = analysis_context
         if candidate_file_keys:
@@ -130,7 +182,7 @@ class CxxtractHttpClient:
             "/agent/investigate-symbol",
             body=body,
             optional_fields=["candidate_file_keys", "analysis_context"],
-            headers={"x-cxxtract-workspace-id": self.workspace_id},
+            headers={"x-cxxtract-workspace-id": resolved_workspace_id},
         )
 
     def agent_search_analyze_recent_commits(self, *, query: str, limit: int = 5) -> dict[str, Any]:
@@ -163,9 +215,11 @@ class CxxtractHttpClient:
         max_files: int = 200,
         timeout_s: int = 30,
         context_lines: int = 0,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "query": query,
             "mode": mode,
             "scope": scope or {"entry_repos": [], "max_repo_hops": 2, "path_prefixes": []},
@@ -189,9 +243,11 @@ class CxxtractHttpClient:
         path_prefixes: list[str] | None = None,
         bootstrap_file_keys: list[str] | None = None,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "symbol": symbol,
             "scope": {
                 "entry_repos": entry_repos or [],
@@ -216,9 +272,11 @@ class CxxtractHttpClient:
         *,
         file_key: str,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "file_key": file_key,
         }
         if analysis_context:
@@ -231,9 +289,11 @@ class CxxtractHttpClient:
         candidate_file_keys: list[str],
         max_files: int,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "candidate_file_keys": candidate_file_keys,
             "max_files": max_files,
         }
@@ -249,9 +309,11 @@ class CxxtractHttpClient:
         timeout_s: int,
         skip_if_fresh: bool = True,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "file_keys": file_keys,
             "max_parse_workers": max_parse_workers,
             "timeout_s": timeout_s,
@@ -269,9 +331,11 @@ class CxxtractHttpClient:
         excluded_file_keys: list[str],
         limit: int,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "symbol": symbol,
             "candidate_file_keys": candidate_file_keys,
             "excluded_file_keys": excluded_file_keys,
@@ -289,9 +353,11 @@ class CxxtractHttpClient:
         excluded_file_keys: list[str],
         limit: int,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "symbol": symbol,
             "candidate_file_keys": candidate_file_keys,
             "excluded_file_keys": excluded_file_keys,
@@ -310,9 +376,11 @@ class CxxtractHttpClient:
         excluded_file_keys: list[str],
         limit: int,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
         body: dict[str, Any] = {
-            "workspace_id": self.workspace_id,
+            "workspace_id": resolved_workspace_id,
             "symbol": symbol,
             "direction": direction,
             "candidate_file_keys": candidate_file_keys,
@@ -350,11 +418,13 @@ class CxxtractHttpClient:
         start_line: int = 1,
         end_line: int = 220,
         max_bytes: int = 120_000,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id)
         return self._post(
             "/explore/read-file",
             {
-                "workspace_id": self.workspace_id,
+                "workspace_id": resolved_workspace_id,
                 "file_key": file_key,
                 "start_line": start_line,
                 "end_line": end_line,
@@ -367,8 +437,10 @@ class CxxtractHttpClient:
         *,
         file_key: str,
         analysis_context: dict[str, Any] | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"workspace_id": self.workspace_id, "file_key": file_key}
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id, analysis_context=analysis_context)
+        body: dict[str, Any] = {"workspace_id": resolved_workspace_id, "file_key": file_key}
         if analysis_context:
             body["analysis_context"] = analysis_context
         return self._post("/explore/get-compile-command", body)

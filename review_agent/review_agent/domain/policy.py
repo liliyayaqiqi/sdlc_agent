@@ -30,6 +30,26 @@ def _confidence_for_fact_sheet(fact_sheet: ReviewFactSheet) -> str:
     return "low"
 
 
+def _is_macro_only_symbol_fact(fact) -> bool:
+    warnings = set(str(item) for item in getattr(fact, "warnings", []) or [])
+    conf = getattr(fact, "confidence", None)
+    verified_ratio = float(getattr(conf, "verified_ratio", 0.0) or 0.0) if conf is not None else 0.0
+    return (
+        bool(getattr(fact, "candidate_file_keys", []))
+        and verified_ratio <= 0.0
+        and "macro_fallback_used" in warnings
+        and int(getattr(fact, "head_reference_count", 0) or 0) == 0
+        and int(getattr(fact, "head_call_edge_count", 0) or 0) == 0
+        and not list(getattr(fact, "parsed_file_keys", []) or [])
+    )
+
+
+def _finding_is_macro_only_speculation(finding: ReviewFinding) -> bool:
+    if not finding.evidence:
+        return False
+    return all(ev.tool == "agent.investigate_symbol" for ev in finding.evidence)
+
+
 def finalize_report(
     *,
     draft: SynthesisDraft,
@@ -43,6 +63,11 @@ def finalize_report(
     publish_result: PublishResult | None = None,
 ) -> ReviewReport:
     findings: list[ReviewFinding] = []
+    macro_only_review = (
+        fact_sheet.coverage.verified_ratio <= 0.0
+        and bool(fact_sheet.symbol_facts)
+        and all(_is_macro_only_symbol_fact(fact) for fact in fact_sheet.symbol_facts if fact.candidate_file_keys)
+    )
     for finding in draft.findings:
         if finding.severity in {Severity.HIGH, Severity.CRITICAL} and not finding.evidence:
             finding = finding.model_copy(
@@ -51,6 +76,11 @@ def finalize_report(
                     "tags": sorted(set(finding.tags + ["auto_downgraded_missing_evidence"])),
                 }
             )
+        if macro_only_review and (
+            finding.category != FindingCategory.CONFIDENCE_GAP
+            or _finding_is_macro_only_speculation(finding)
+        ):
+            continue
         findings.append(finding)
 
     low_cov = fact_sheet.coverage.verified_ratio < 0.4
@@ -71,6 +101,21 @@ def finalize_report(
                 ],
                 confidence=0.95,
                 tags=["coverage_policy"],
+            )
+        )
+
+    if macro_only_review:
+        findings.append(
+            ReviewFinding(
+                id=f"macro-only-{workspace_id}",
+                severity=Severity.HIGH,
+                category=FindingCategory.CONFIDENCE_GAP,
+                title="Semantic review fell back to macro-only evidence",
+                impact="Candidate files were identified, but semantic parsing and verification produced zero validated references or call edges. Model findings based only on macro summaries were suppressed.",
+                recommendation="Rerun with SHA-pinned derived workspaces and a matching compile database, or treat this review as indeterminate and perform manual inspection.",
+                evidence=[EvidenceRef(tool="policy_gate", description="macro_only_semantic_gap")],
+                confidence=0.99,
+                tags=["macro_only_semantic_gap"],
             )
         )
 
@@ -110,13 +155,15 @@ def finalize_report(
     exec_status = ReviewExecutionStatus.BLOCK if blocking > 0 else ReviewExecutionStatus.PASS
     indeterminate_reason = ""
     should_block = blocking > 0
-    if semantic_bootstrap_failed:
+    if semantic_bootstrap_failed or macro_only_review:
         exec_status = ReviewExecutionStatus.INDETERMINATE
-        indeterminate_reason = "semantic_bootstrap_failed"
+        indeterminate_reason = "semantic_bootstrap_failed" if semantic_bootstrap_failed else "macro_only_semantic_gap"
         should_block = True
     summary = draft.summary.strip() or f"Reviewed {len(fact_sheet.changed_files)} files; findings={len(findings)}."
     if semantic_bootstrap_failed and "semantic bootstrap" not in summary.lower():
         summary = f"{summary} Semantic bootstrap failed for the changed files, so verification coverage is incomplete."
+    if macro_only_review and "macro-only" not in summary.lower():
+        summary = f"{summary} Semantic verification fell back to macro-only evidence, so automated findings were suppressed."
 
     decision = ReviewDecision(
         fail_threshold=fail_threshold,

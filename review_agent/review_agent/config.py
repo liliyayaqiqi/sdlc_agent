@@ -34,6 +34,7 @@ class AgentSettings(BaseModel):
     log_level: str = "WARNING"
     enable_cache: bool = True
     cache_dir: str = ".review_agent_cache"
+    use_derived_workspaces: bool = False
 
     @classmethod
     def from_env(cls) -> "AgentSettings":
@@ -64,4 +65,5 @@ class AgentSettings(BaseModel):
             log_level=os.getenv("REVIEW_AGENT_LOG_LEVEL", "WARNING").strip().upper() or "WARNING",
             enable_cache=os.getenv("REVIEW_AGENT_ENABLE_CACHE", "true").strip().lower() in {"1", "true", "yes", "on"},
             cache_dir=os.getenv("REVIEW_AGENT_CACHE_DIR", ".review_agent_cache").strip() or ".review_agent_cache",
+            use_derived_workspaces=os.getenv("REVIEW_AGENT_USE_DERIVED_WORKSPACES", "false").strip().lower() in {"1", "true", "yes", "on"},
         )

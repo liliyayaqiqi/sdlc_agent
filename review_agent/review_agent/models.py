@@ -433,9 +433,14 @@ class ViewContextMaterialization(BaseModel):
     baseline_context_id: str = ""
     head_context_id: str = ""
     merge_preview_context_id: str = ""
+    baseline_workspace_id: str = ""
+    head_workspace_id: str = ""
+    merge_preview_workspace_id: str = ""
     baseline_materialized: bool = False
     head_materialized: bool = False
     merge_preview_materialized: bool = False
+    materialization_id: str = ""
+    materialization_status: str = ""
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -600,6 +605,7 @@ class ReviewRequest(BaseModel):
     cache_dir: str = ".review_agent_cache"
     infra_fail_mode: str = "block"  # "block" or "pass"
     workspace_fingerprint: str = ""
+    use_derived_workspaces: bool = False
 
     @model_validator(mode="after")
     def _validate_request(self) -> "ReviewRequest":

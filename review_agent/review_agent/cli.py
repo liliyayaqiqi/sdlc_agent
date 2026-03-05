@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         cache_dir=args.cache_dir or settings.cache_dir,
         infra_fail_mode=infra_fail_mode,
         workspace_fingerprint=args.workspace_fingerprint or "",
+        use_derived_workspaces=bool(args.use_derived_workspaces) if args.use_derived_workspaces else settings.use_derived_workspaces,
     )
 
     logger.info(
@@ -179,6 +180,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--log-level", default="", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level")
     run.add_argument("--no-cache", action="store_true", default=False, help="Disable local review trace cache")
     run.add_argument("--cache-dir", default="", help="Directory for review trace cache")
+    run.add_argument(
+        "--use-derived-workspaces",
+        action="store_true",
+        default=False,
+        help="Use target/head/merge derived CXXtract workspaces instead of PR overlays",
+    )
     run.add_argument(
         "--infra-fail-mode",
         default="block",

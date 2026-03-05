@@ -48,6 +48,7 @@ from review_agent.orchestrator import (
     _is_merge_degraded,
     _normalize_bundle_and_scope_repos,
     _policy_gate,
+    _should_use_derived_workspaces,
     _workspace_lock,
 )
 from review_agent.patch_parser import parse_unified_diff
@@ -161,6 +162,20 @@ class _ScopedClient(_NullClient):
     def explore_list_candidates(self, **kw):
         self.list_calls.append(kw)
         return {"candidates": []}
+
+
+class _DerivedWorkspaceClient(_NullClient):
+    def materialize_review_workspaces(self, **kw):
+        return {
+            "materialization_id": "mat:123",
+            "status": "ready",
+            "warnings": [],
+            "derived_workspaces": [
+                {"workspace_id": "ws:review:target", "view_role": "target", "status": "ready", "warnings": []},
+                {"workspace_id": "ws:review:head", "view_role": "head", "status": "ready", "warnings": []},
+                {"workspace_id": "ws:review:merge", "view_role": "merge", "status": "degraded", "warnings": ["merge_missing_compdb"]},
+            ],
+        }
 
 
 class _BootstrapCandidateClient(_NullClient):
@@ -422,6 +437,7 @@ class TestCache:
                 "parse_workers": 4,
                 "max_candidates_per_symbol": 150,
                 "max_fetch_limit": 2000,
+                "use_derived_workspaces": False,
                 "agent_version": "0.3.1",
                 "prompt_version": "2026-02-28",
                 "parser_version": "2",
@@ -522,6 +538,107 @@ class TestMergeAndPolicy:
         assert final.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
         assert final.decision.indeterminate_reason == "semantic_bootstrap_failed"
         assert any("semantic_bootstrap_failed" in finding.tags for finding in final.findings)
+
+    def test_policy_gate_suppresses_macro_only_speculative_findings(self):
+        report = ReviewReport(
+            workspace_id="ws",
+            summary="",
+            findings=[
+                ReviewFinding(
+                    id="f1",
+                    severity=Severity.HIGH,
+                    category=FindingCategory.HIDDEN_SIDE_EFFECT,
+                    title="Speculative macro finding",
+                    impact="impact",
+                    recommendation="recommend",
+                    evidence=[EvidenceRef(tool="agent.investigate_symbol", description="macro only")],
+                    confidence=0.4,
+                )
+            ],
+            coverage=CoverageSummary(),
+            decision=ReviewDecision(fail_threshold=Severity.HIGH, blocking_findings=0, should_block=False),
+        )
+        fact_sheet = ReviewFactSheet(
+            changed_files=["src/app.cpp"],
+            coverage=CoverageSummary(verified_ratio=0.0, total_candidates=1),
+            symbol_facts=[
+                SymbolFact(
+                    symbol="Foo::bar",
+                    candidate_file_keys=["repoA:src/app.cpp"],
+                    parsed_file_keys=[],
+                    head_reference_count=0,
+                    head_call_edge_count=0,
+                    confidence={"verified_ratio": 0.0, "total_candidates": 1},
+                    warnings=["macro_fallback_used"],
+                )
+            ],
+        )
+        final = _policy_gate(
+            report=report,
+            fact_sheet=fact_sheet,
+            test_impact=ReviewTestImpact(),
+            fail_threshold=Severity.HIGH,
+            tool_usage=[],
+            workspace_id="ws",
+        )
+        assert final.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert final.decision.indeterminate_reason == "macro_only_semantic_gap"
+        assert not any(f.title == "Speculative macro finding" for f in final.findings)
+        assert any("macro_only_semantic_gap" in finding.tags for finding in final.findings)
+
+    def test_policy_gate_suppresses_all_non_confidence_findings_when_macro_only(self):
+        report = ReviewReport(
+            workspace_id="ws",
+            summary="",
+            findings=[],
+            coverage=CoverageSummary(),
+            decision=ReviewDecision(fail_threshold=Severity.HIGH, blocking_findings=0, should_block=False),
+        )
+        fact_sheet = ReviewFactSheet(
+            changed_files=["src/app.cpp"],
+            coverage=CoverageSummary(verified_ratio=0.0, total_candidates=1),
+            symbol_facts=[
+                SymbolFact(
+                    symbol="Foo::bar",
+                    candidate_file_keys=["repoA:src/app.cpp"],
+                    parsed_file_keys=[],
+                    head_reference_count=0,
+                    head_call_edge_count=0,
+                    confidence={"verified_ratio": 0.0, "total_candidates": 1},
+                    warnings=["macro_fallback_used"],
+                )
+            ],
+        )
+        report = ReviewReport(
+            workspace_id="ws",
+            summary="macro only",
+            findings=[
+                ReviewFinding(
+                    id="H-1",
+                    severity=Severity.HIGH,
+                    category=FindingCategory.HIDDEN_SIDE_EFFECT,
+                    title="Lock missing on queue",
+                    impact="impact",
+                    recommendation="recommend",
+                    evidence=[EvidenceRef(description="narrow lexical snippet only")],
+                    confidence=0.6,
+                )
+            ],
+            coverage=CoverageSummary(),
+            decision=ReviewDecision(fail_threshold=Severity.HIGH, blocking_findings=0, should_block=False),
+        )
+        final = _policy_gate(
+            report=report,
+            fact_sheet=fact_sheet,
+            test_impact=ReviewTestImpact(),
+            fail_threshold=Severity.HIGH,
+            tool_usage=[],
+            workspace_id="ws",
+        )
+        assert final.decision.execution_status == ReviewExecutionStatus.INDETERMINATE
+        assert final.decision.indeterminate_reason == "macro_only_semantic_gap"
+        assert not any(f.title == "Lock missing on queue" for f in final.findings)
+        assert any("macro_only_semantic_gap" in finding.tags for finding in final.findings)
 
     def test_indeterminate_report_has_low_confidence(self):
         report = _indeterminate_report(
@@ -685,6 +802,49 @@ class TestViewPreparation:
         )
         assert views.status.baseline_materialized is False
         assert any("baseline_sync_failed:repoA" in warn for warn in views.status.warnings)
+
+    def test_prepare_views_uses_derived_workspaces_when_enabled(self, tmp_path):
+        orchestrator = ReviewOrchestrator(client=_DerivedWorkspaceClient())
+        bundle = ReviewContextBundle(
+            workspace_id="ws",
+            patch_text="diff --git a/a b/a\n",
+            head_sha="b" * 40,
+            target_branch_head_sha="c" * 40,
+            merge_preview_sha="d" * 40,
+            workspace_fingerprint="repoA:head:target",
+            repo_revisions=[RepoRevisionContext(repo_id="repoA", target_sha="c" * 40, head_sha="b" * 40, merge_sha="d" * 40, role="primary")],
+            pr_metadata={"pr_id": "1", "target_branch": "main", "source_branch": "feature"},
+        )
+        views = orchestrator._prepare_views(
+            client=_DerivedWorkspaceClient(),
+            runtime_context=bundle,
+            lock_root=str(tmp_path),
+            created_context_ids=[],
+            run_id="run123",
+            use_derived_workspaces=True,
+        )
+        assert views.head["workspace_id"] == "ws:review:head"
+        assert views.baseline["context_id"] == "ws:review:target:baseline"
+        assert views.status.materialization_id == "mat:123"
+        assert views.status.head_workspace_id == "ws:review:head"
+
+    def test_should_use_derived_workspaces_for_gitlab_mr_inputs(self):
+        req = ReviewRequest(workspace_id="ws", patch_text="diff --git a/a b/a\n", llm_model="fixture:default")
+        runtime = ReviewContextIngestor.ingest(
+            req.model_copy(
+                update={
+                    "context_bundle": ReviewContextBundle(
+                        workspace_id="ws",
+                        patch_text="diff --git a/a b/a\n",
+                        head_sha="b" * 40,
+                        target_branch_head_sha="c" * 40,
+                        repo_revisions=[RepoRevisionContext(repo_id="repoA", target_sha="c" * 40, head_sha="b" * 40, role="primary")],
+                        pr_metadata={"pr_id": "1"},
+                    )
+                }
+            )
+        )
+        assert _should_use_derived_workspaces(req, runtime) is True
 
 
 class TestHealthCheckAndImpact:

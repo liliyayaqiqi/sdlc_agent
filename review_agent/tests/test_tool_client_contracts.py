@@ -43,6 +43,38 @@ def test_workspace_info_uses_expected_path():
     assert captured["url"].endswith("/workspace/ws_main")
 
 
+def test_workspace_info_accepts_workspace_override():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"workspace_id": "ws_head"}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, params=None, headers=None):
+            captured["url"] = url
+            return _Resp()
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        body = client.workspace_info(workspace_id="ws_head")
+    assert body["workspace_id"] == "ws_head"
+    assert captured["url"].endswith("/workspace/ws_head")
+
+
 def test_non_2xx_raises_structured_error():
     class _Resp:
         status_code = 422
@@ -187,6 +219,42 @@ def test_explore_candidates_accepts_analysis_context():
     assert captured["json"]["scope"]["path_prefixes"] == ["src/module"]
 
 
+def test_explore_candidates_uses_analysis_context_workspace_override():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"candidates": []}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["json"] = json
+            return _Resp()
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        client.explore_list_candidates(
+            symbol="foo",
+            max_files=10,
+            analysis_context={"mode": "baseline", "context_id": "ws_head:baseline", "workspace_id": "ws_head"},
+        )
+
+    assert captured["json"]["workspace_id"] == "ws_head"
+
+
 def test_explore_candidates_accepts_bootstrap_file_keys():
     captured = {}
 
@@ -311,6 +379,45 @@ def test_query_file_symbols_uses_expected_path():
     assert captured["url"].endswith("/query/file-symbols")
     assert captured["json"]["file_key"] == "repoA:src/main.cpp"
     assert captured["json"]["analysis_context"]["mode"] == "pr"
+
+
+def test_materialize_review_workspaces_posts_workspace_scoped_request():
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"materialization_id": "mat:123", "workspace_id": "ws_main", "review_key": "mr18"}
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _Resp()
+
+    with patch("review_agent.tool_clients.cxxtract_http_client.httpx.Client", _Client):
+        client = CxxtractHttpClient("http://127.0.0.1:8000", "ws_main")
+        client.materialize_review_workspaces(
+            review_key="mr18",
+            repo_revisions=[{"repo_id": "repoA", "target_sha": "a" * 40}],
+            views=["target", "head"],
+        )
+
+    assert captured["url"].endswith("/workspace/ws_main/materialize-review")
+    assert captured["json"]["workspace_id"] == "ws_main"
+    assert captured["json"]["views"] == ["target", "head"]
 
 
 def test_gitlab_get_retries_on_transient_error():

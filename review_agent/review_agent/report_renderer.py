@@ -90,6 +90,13 @@ def render_markdown(report: ReviewReport) -> str:
         lines.append(f"- Suspicious anchors: `{len(report.fact_sheet.suspicious_anchors)}`")
         lines.append(f"- Changed declarations: `{len(report.fact_sheet.changed_declarations)}`")
         lines.append(f"- Member call sites: `{len(report.fact_sheet.member_call_sites)}`")
+        if report.fact_sheet.view_contexts.materialization_id:
+            lines.append(f"- Review materialization: `{report.fact_sheet.view_contexts.materialization_id}` ({report.fact_sheet.view_contexts.materialization_status or 'unknown'})")
+            lines.append(
+                f"- View workspaces: target=`{report.fact_sheet.view_contexts.baseline_workspace_id or report.workspace_id}` "
+                f"head=`{report.fact_sheet.view_contexts.head_workspace_id or report.workspace_id}` "
+                f"merge=`{report.fact_sheet.view_contexts.merge_preview_workspace_id or 'n/a'}`"
+            )
         if report.fact_sheet.symbol_facts:
             lines.append("")
             lines.append("### Symbol Confidence")

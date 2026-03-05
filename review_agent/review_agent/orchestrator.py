@@ -138,6 +138,20 @@ class ViewContexts:
     status: ViewContextMaterialization
 
 
+def _view_workspace_id(view: dict[str, Any] | None, fallback_workspace_id: str) -> str:
+    return str((view or {}).get("workspace_id", "") or fallback_workspace_id)
+
+
+def _should_use_derived_workspaces(request: ReviewRequest, runtime_context: IngestedReviewContext) -> bool:
+    if request.use_derived_workspaces:
+        return True
+    if not runtime_context.repo_revisions:
+        return False
+    if not _is_sha(runtime_context.head_sha) or not _is_sha(runtime_context.target_branch_head_sha):
+        return False
+    return bool(runtime_context.pr_metadata)
+
+
 @dataclass(frozen=True)
 class RetrievalStage:
     """One candidate-discovery widening stage."""
@@ -388,6 +402,7 @@ class ReviewOrchestrator:
             entry_repos or [],
             [stage.name for stage in retrieval_stages],
         )
+        use_derived_workspaces = _should_use_derived_workspaces(request, runtime)
         retrieval_widening_events: list[dict[str, Any]] = []
 
         # --- Cache lookup BEFORE view materialization ---
@@ -412,6 +427,7 @@ class ReviewOrchestrator:
                     "parse_workers": runtime.parse_workers,
                     "max_candidates_per_symbol": runtime.max_candidates_per_symbol,
                     "max_fetch_limit": runtime.max_fetch_limit,
+                    "use_derived_workspaces": bool(use_derived_workspaces),
                     "agent_version": AGENT_VERSION,
                     "prompt_version": PROMPT_VERSION,
                     "parser_version": PARSER_VERSION,
@@ -442,6 +458,7 @@ class ReviewOrchestrator:
         views = self._prepare_views(
             client=client, runtime_context=bundle,
             lock_root=runtime.cache_dir, created_context_ids=created_context_ids, run_id=run_id,
+            use_derived_workspaces=bool(use_derived_workspaces),
         )
         logger.info(
             "[%s] views ready baseline=%s head=%s merge=%s warnings=%d",
@@ -733,6 +750,138 @@ class ReviewOrchestrator:
         lock_root: str,
         created_context_ids: list[str],
         run_id: str,
+        use_derived_workspaces: bool = False,
+    ) -> ViewContexts:
+        if use_derived_workspaces:
+            try:
+                return self._prepare_review_workspaces(
+                    client=client,
+                    runtime_context=runtime_context,
+                    run_id=run_id,
+                )
+            except Exception as exc:
+                logger.warning("derived workspace materialization failed; falling back to overlays: %s", exc)
+                fallback = self._prepare_overlay_views(
+                    client=client,
+                    runtime_context=runtime_context,
+                    lock_root=lock_root,
+                    created_context_ids=created_context_ids,
+                    run_id=run_id,
+                )
+                fallback.status = fallback.status.model_copy(
+                    update={"warnings": sorted(set(fallback.status.warnings + [f"derived_workspace_fallback:{exc}"]))}
+                )
+                return fallback
+        return self._prepare_overlay_views(
+            client=client,
+            runtime_context=runtime_context,
+            lock_root=lock_root,
+            created_context_ids=created_context_ids,
+            run_id=run_id,
+        )
+
+    def _prepare_review_workspaces(
+        self,
+        *,
+        client: CxxtractHttpClient,
+        runtime_context,
+        run_id: str,
+    ) -> ViewContexts:
+        repo_revisions: list[RepoRevisionContext] = list(runtime_context.repo_revisions or [])
+        if not repo_revisions:
+            raise ValueError("repo_revisions are required for derived workspace materialization")
+
+        views = ["target", "head"]
+        if _is_sha(runtime_context.merge_preview_sha):
+            views.append("merge")
+
+        materialized = client.materialize_review_workspaces(
+            review_key=":".join(
+                filter(
+                    None,
+                    [
+                        runtime_context.workspace_fingerprint,
+                        runtime_context.head_sha,
+                        runtime_context.target_branch_head_sha,
+                        runtime_context.merge_preview_sha,
+                    ],
+                )
+            )
+            or run_id,
+            repo_revisions=[
+                {
+                    "repo_id": row.repo_id,
+                    "target_sha": row.target_sha,
+                    "head_sha": row.head_sha,
+                    "merge_sha": row.merge_sha,
+                    "target_branch": str(runtime_context.pr_metadata.get("target_branch", "")),
+                    "source_branch": str(runtime_context.pr_metadata.get("source_branch", "")),
+                    "changed": row.role == "primary" or bool(row.head_sha and row.head_sha != row.target_sha),
+                }
+                for row in repo_revisions
+            ],
+            views=views,
+        )
+        derived_by_role = {
+            str(row.get("view_role", "")): row
+            for row in list(materialized.get("derived_workspaces", []) or [])
+            if str(row.get("view_role", "")).strip()
+        }
+        target = derived_by_role.get("target")
+        head = derived_by_role.get("head")
+        merge = derived_by_role.get("merge")
+        if not target or not head:
+            raise ValueError("derived workspace materialization did not return target/head workspaces")
+
+        baseline_workspace_id = str(target.get("workspace_id", "")).strip()
+        head_workspace_id = str(head.get("workspace_id", "")).strip()
+        merge_workspace_id = str(merge.get("workspace_id", "")).strip() if merge else ""
+
+        baseline_context_id = f"{baseline_workspace_id}:baseline"
+        head_context_id = f"{head_workspace_id}:baseline"
+        merge_context_id = f"{merge_workspace_id}:baseline" if merge_workspace_id else ""
+
+        warnings = sorted(
+            set(
+                [str(item) for item in list(materialized.get("warnings", []) or [])]
+                + [str(item) for item in list(target.get("warnings", []) or [])]
+                + [str(item) for item in list(head.get("warnings", []) or [])]
+                + ([str(item) for item in list(merge.get("warnings", []) or [])] if merge else [])
+            )
+        )
+        status = ViewContextMaterialization(
+            baseline_context_id=baseline_context_id,
+            head_context_id=head_context_id,
+            merge_preview_context_id=merge_context_id,
+            baseline_workspace_id=baseline_workspace_id,
+            head_workspace_id=head_workspace_id,
+            merge_preview_workspace_id=merge_workspace_id,
+            baseline_materialized=bool(baseline_workspace_id),
+            head_materialized=bool(head_workspace_id),
+            merge_preview_materialized=bool(merge_workspace_id) if runtime_context.merge_preview_sha else False,
+            materialization_id=str(materialized.get("materialization_id", "")),
+            materialization_status=str(materialized.get("status", "")),
+            warnings=warnings,
+        )
+        return ViewContexts(
+            baseline={"mode": "baseline", "context_id": baseline_context_id, "workspace_id": baseline_workspace_id},
+            head={"mode": "baseline", "context_id": head_context_id, "workspace_id": head_workspace_id},
+            merge_preview=(
+                {"mode": "baseline", "context_id": merge_context_id, "workspace_id": merge_workspace_id}
+                if merge_workspace_id
+                else None
+            ),
+            status=status,
+        )
+
+    def _prepare_overlay_views(
+        self,
+        *,
+        client: CxxtractHttpClient,
+        runtime_context,
+        lock_root: str,
+        created_context_ids: list[str],
+        run_id: str,
     ) -> ViewContexts:
         ws_id = runtime_context.workspace_id
         baseline_id = f"{ws_id}:baseline"
@@ -826,15 +975,18 @@ class ReviewOrchestrator:
             baseline_context_id=baseline_id,
             head_context_id=head_id,
             merge_preview_context_id=merge_id if runtime_context.merge_preview_sha else "",
+            baseline_workspace_id=ws_id,
+            head_workspace_id=ws_id,
+            merge_preview_workspace_id=ws_id if runtime_context.merge_preview_sha else "",
             baseline_materialized=baseline_materialized,
             head_materialized=head_materialized,
             merge_preview_materialized=merge_materialized,
             warnings=warnings,
         )
         return ViewContexts(
-            baseline={"mode": "baseline", "context_id": baseline_id},
-            head={"mode": "pr", "context_id": head_id, "pr_id": pr_id},
-            merge_preview={"mode": "pr", "context_id": merge_id, "pr_id": f"{pr_id}-merge"} if runtime_context.merge_preview_sha else None,
+            baseline={"mode": "baseline", "context_id": baseline_id, "workspace_id": ws_id},
+            head={"mode": "pr", "context_id": head_id, "pr_id": pr_id, "workspace_id": ws_id},
+            merge_preview={"mode": "pr", "context_id": merge_id, "pr_id": f"{pr_id}-merge", "workspace_id": ws_id} if runtime_context.merge_preview_sha else None,
             status=status,
         )
 
@@ -1191,6 +1343,7 @@ def _collect_symbol_from_candidates(
             start_line=max(1, line - 8),
             end_line=line + 8,
             max_bytes=32_000,
+            workspace_id=_view_workspace_id(analysis_context, str(getattr(client, "workspace_id", ""))),
         )
         if row.get("content"):
             read_contexts.append(row)
@@ -1205,6 +1358,7 @@ def _collect_symbol_from_candidates(
             start_line=1,
             end_line=120,
             max_bytes=32_000,
+            workspace_id=_view_workspace_id(analysis_context, str(getattr(client, "workspace_id", ""))),
         )
         if row.get("content"):
             read_contexts.append(row)
