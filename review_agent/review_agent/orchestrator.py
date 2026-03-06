@@ -138,6 +138,15 @@ class ViewContexts:
     status: ViewContextMaterialization
 
 
+@dataclass(frozen=True)
+class _ViewPrepareCompatRequest:
+    """Compatibility request shim for internal/tests calling _prepare_views directly."""
+
+    baseline_refresh_enabled: bool = False
+    baseline_refresh_timeout_s: int = 300
+    infra_fail_mode: str = "pass"
+
+
 def _view_workspace_id(view: dict[str, Any] | None, fallback_workspace_id: str) -> str:
     return str((view or {}).get("workspace_id", "") or fallback_workspace_id)
 
@@ -458,6 +467,7 @@ class ReviewOrchestrator:
         views = self._prepare_views(
             client=client, runtime_context=bundle,
             lock_root=runtime.cache_dir, created_context_ids=created_context_ids, run_id=run_id,
+            request=request,
             use_derived_workspaces=bool(use_derived_workspaces),
         )
         logger.info(
@@ -746,16 +756,19 @@ class ReviewOrchestrator:
         self,
         *,
         client: CxxtractHttpClient,
+        request: ReviewRequest | None = None,
         runtime_context,
         lock_root: str,
         created_context_ids: list[str],
         run_id: str,
         use_derived_workspaces: bool = False,
     ) -> ViewContexts:
+        resolved_request: ReviewRequest | _ViewPrepareCompatRequest = request or _ViewPrepareCompatRequest()
         if use_derived_workspaces:
             try:
                 return self._prepare_review_workspaces(
                     client=client,
+                    request=resolved_request,
                     runtime_context=runtime_context,
                     run_id=run_id,
                 )
@@ -784,12 +797,41 @@ class ReviewOrchestrator:
         self,
         *,
         client: CxxtractHttpClient,
+        request: ReviewRequest | _ViewPrepareCompatRequest,
         runtime_context,
         run_id: str,
     ) -> ViewContexts:
         repo_revisions: list[RepoRevisionContext] = list(runtime_context.repo_revisions or [])
         if not repo_revisions:
             raise ValueError("repo_revisions are required for derived workspace materialization")
+
+        refresh_warnings: list[str] = []
+        if request.baseline_refresh_enabled:
+            target_branch = str(runtime_context.pr_metadata.get("target_branch", "")).strip()
+            repo_ids = sorted({row.repo_id for row in repo_revisions if row.repo_id})
+            branch_overrides = {repo_id: target_branch for repo_id in repo_ids if target_branch}
+            try:
+                refresh = client.baseline_refresh(
+                    repo_ids=repo_ids,
+                    branch_overrides=branch_overrides,
+                    wait_for_completion=True,
+                    timeout_s=int(request.baseline_refresh_timeout_s),
+                    reason="review_agent",
+                    workspace_id=runtime_context.workspace_id,
+                )
+                refresh_status = str(refresh.get("status", "")).strip().lower()
+                refresh_warnings.extend(str(item) for item in list(refresh.get("warnings", []) or []))
+                if refresh_status in {"failed", "timeout"}:
+                    msg = f"baseline_refresh_{refresh_status}"
+                    if request.infra_fail_mode != "pass":
+                        raise InfrastructureError(msg)
+                    refresh_warnings.append(msg)
+                elif refresh_status == "partial":
+                    refresh_warnings.append("baseline_refresh_partial")
+            except Exception as exc:
+                if request.infra_fail_mode != "pass":
+                    raise InfrastructureError(f"baseline_refresh_failed:{exc}") from exc
+                refresh_warnings.append(f"baseline_refresh_failed:{exc}")
 
         views = ["target", "head"]
         if _is_sha(runtime_context.merge_preview_sha):
@@ -847,6 +889,7 @@ class ReviewOrchestrator:
                 + [str(item) for item in list(target.get("warnings", []) or [])]
                 + [str(item) for item in list(head.get("warnings", []) or [])]
                 + ([str(item) for item in list(merge.get("warnings", []) or [])] if merge else [])
+                + refresh_warnings
             )
         )
         status = ViewContextMaterialization(

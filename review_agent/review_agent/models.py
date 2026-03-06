@@ -606,6 +606,8 @@ class ReviewRequest(BaseModel):
     infra_fail_mode: str = "block"  # "block" or "pass"
     workspace_fingerprint: str = ""
     use_derived_workspaces: bool = False
+    baseline_refresh_enabled: bool = True
+    baseline_refresh_timeout_s: int = 300
 
     @model_validator(mode="after")
     def _validate_request(self) -> "ReviewRequest":

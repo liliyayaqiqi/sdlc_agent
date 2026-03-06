@@ -35,6 +35,8 @@ class AgentSettings(BaseModel):
     enable_cache: bool = True
     cache_dir: str = ".review_agent_cache"
     use_derived_workspaces: bool = False
+    baseline_refresh_enabled: bool = True
+    baseline_refresh_timeout_s: int = Field(default=300, ge=1, le=3600)
 
     @classmethod
     def from_env(cls) -> "AgentSettings":
@@ -66,4 +68,6 @@ class AgentSettings(BaseModel):
             enable_cache=os.getenv("REVIEW_AGENT_ENABLE_CACHE", "true").strip().lower() in {"1", "true", "yes", "on"},
             cache_dir=os.getenv("REVIEW_AGENT_CACHE_DIR", ".review_agent_cache").strip() or ".review_agent_cache",
             use_derived_workspaces=os.getenv("REVIEW_AGENT_USE_DERIVED_WORKSPACES", "false").strip().lower() in {"1", "true", "yes", "on"},
+            baseline_refresh_enabled=os.getenv("REVIEW_AGENT_BASELINE_REFRESH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+            baseline_refresh_timeout_s=int(os.getenv("REVIEW_AGENT_BASELINE_REFRESH_TIMEOUT_S", "300")),
         )

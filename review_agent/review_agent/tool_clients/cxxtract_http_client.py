@@ -131,6 +131,30 @@ class CxxtractHttpClient:
             },
         )
 
+    def baseline_refresh(
+        self,
+        *,
+        repo_ids: list[str] | None = None,
+        branch_overrides: dict[str, str] | None = None,
+        force_clean: bool = True,
+        wait_for_completion: bool = True,
+        timeout_s: int = 300,
+        reason: str = "review_agent",
+        workspace_id: str = "",
+    ) -> dict[str, Any]:
+        resolved_workspace_id = self._resolve_workspace_id(workspace_id=workspace_id)
+        return self._post(
+            f"/workspace/{quote(resolved_workspace_id, safe='')}/baseline/refresh",
+            {
+                "repo_ids": repo_ids or [],
+                "branch_overrides": branch_overrides or {},
+                "force_clean": bool(force_clean),
+                "wait_for_completion": bool(wait_for_completion),
+                "timeout_s": int(timeout_s),
+                "reason": reason,
+            },
+        )
+
     def materialize_review_workspaces(
         self,
         *,

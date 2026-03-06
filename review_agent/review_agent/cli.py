@@ -82,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
         infra_fail_mode=infra_fail_mode,
         workspace_fingerprint=args.workspace_fingerprint or "",
         use_derived_workspaces=bool(args.use_derived_workspaces) if args.use_derived_workspaces else settings.use_derived_workspaces,
+        baseline_refresh_enabled=settings.baseline_refresh_enabled,
+        baseline_refresh_timeout_s=settings.baseline_refresh_timeout_s,
     )
 
     logger.info(
